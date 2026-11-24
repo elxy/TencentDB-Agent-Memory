@@ -353,6 +353,9 @@ export function buildL0VersionMetadata(
 /** System/volatile keys that must not participate in the no-op comparison. */
 const VOLATILE_METADATA_KEYS: ReadonlySet<string> = new Set([
   "_legacy_import", "updatedAt", "updated_at", "record_version", "version",
+  // 程序写入的请求指纹不是内容语义：同一条 L1 换个 operation 重写同样的归属，
+  // 不能被当成一次“新版本”。
+  PROGRAM_REQUEST_METADATA_KEY,
 ]);
 
 function comparableMetadata(meta: Record<string, unknown>): Record<string, unknown> {

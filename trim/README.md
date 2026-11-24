@@ -28,9 +28,15 @@ prints the counts. It does not commit.
 
 ## What Ernest depends on here
 
-- `/v3/content/write` with `layer=l1` `change=create|retire` and `layer=l3`
+- `/v3/content/write` with `layer=l1` `change=create|retire|retag` and `layer=l3`
   `create|revise` (`src/gateway/content-write-handlers.ts`) — **local addition**;
   upstream has no such handler at any ref.
+  `retag` (added 2026-11-24) changes only the same identity's
+  `scene_name`/`type`/`priority`: the body is taken from the current version,
+  `locator`/`content_id`/`l1_source`/`withdraws`/`user_metadata.note` are carried
+  over verbatim, CAS is the current `version_id`, and the version history keeps
+  both sides. It is deliberately **not** a revise — rewriting cognition still
+  needs a new `create` + `withdraws`.
 - Content history (`src/core/content/*`, `src/core/store/sqlite/content-history.ts`)
   and the profile scope (`src/core/profile/profile-scope.ts`).
 - `runtime/memory-core-server.mjs` imports the TS sources through this tree's
@@ -48,6 +54,7 @@ local history planner over a temp directory:
 npx --prefix MemoryCore tsx tests/http.test.mjs
 npx --prefix MemoryCore tsx tests/trim-generation.test.mjs
 npx --prefix MemoryCore tsx tests/trim-http-write.test.mjs
+npx --prefix MemoryCore tsx tests/retag.test.mjs
 ```
 
 They expect `tests/` to be a **sibling** of `MemoryCore/` (the imports are

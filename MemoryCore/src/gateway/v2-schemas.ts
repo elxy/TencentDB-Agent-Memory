@@ -632,8 +632,10 @@ export type ContentChangesRequest = z.infer<typeof contentChangesRequestSchema>;
 //
 // 收窄后的写规则（docs/memory-design-proposal.md §5、implementation-next.md §2）：
 //   - L0：只允许 create（追加对话文字；同 id 不同内容为 409）。
-//   - L1：允许 create（原子认识，必标来源 extraction/agent/arbitration）与 retire
-//     （按 locator 撤回一条既有认识：不写正文、当前行移除、历史保留）；
+//   - L1：允许 create（原子认识，必标来源 extraction/agent/arbitration）、retire
+//     （按 locator 撤回一条既有认识：不写正文、当前行移除、历史保留）与 retag
+//     （只改归属元数据 scene_name/type/priority：正文由当前版本提供、locator 与
+//     历史保留；纠正错误正文不在这条路径上）；
 //     纠正（新认识取代旧认识）仍用 create + `withdraws`。
 //   - L2：拒绝外部直接写入（只由内部整理流程发布）。
 //   - L3：只接受三份文档（user-understanding.md / beliefs.md / current-focus.md）
@@ -648,6 +650,8 @@ export const contentWriteChangeKindSchema = z.enum([
   "revise",
   "retire",
   "restore",
+  /** L1 only: change the same identity's scene_name/type/priority, never its body. */
+  "retag",
 ]);
 export type ContentWriteChangeKind = z.infer<typeof contentWriteChangeKindSchema>;
 

@@ -6,12 +6,15 @@
  *   - **L0：只追加**（change=create）。locator 是稳定消息 id，session_id 必填；
  *     同 id 不同内容为 409；消息来源可标为框架事件（framework_event）。
  *     不再支持 revise：L0 正常只追加，不改原话。
- *   - **L1：新增或撤回**（change=create / retire）。create 是原子认识，必须标来源
- *     l1_source（extraction 提炼 / agent 主动写入 / arbitration 主 Agent 裁决）；
- *     纠正（新认识取代旧认识）用 create + `withdraws`，旧条目原样保留，读取方按
- *     时间与来源调和。retire 撤回一条既有认识：只按 locator 定位（给
+ *   - **L1：新增、撤回或改归属**（change=create / retire / retag）。create 是原子认识，
+ *     必须标来源 l1_source（extraction 提炼 / agent 主动写入 / arbitration 主 Agent
+ *     裁决）；纠正（新认识取代旧认识）用 create + `withdraws`，旧条目原样保留，
+ *     读取方按时间与来源调和。retire 撤回一条既有认识：只按 locator 定位（给
  *     expected_version_id 则做 CAS 校验），不写正文、不带来源，当前行连同
  *     FTS/向量在一个事务里移除，版本历史保留。撤回不是新认识，不该再占一条记忆。
+ *     retag 只改归属元数据（scene_name / type / priority）：正文取自当前版本、
+ *     locator 与历史保留，其余元数据（l1_source、withdraws、user_metadata.note 等）
+ *     逐字沿用；它不能改正文，因此不是 revise 的别名。
  *   - **L2：拒绝外部直接写入**（只由内部整理流程发布）。
  *   - **L3：只接受三份文档**（user-understanding.md / beliefs.md /
  *     current-focus.md）的 create/revise，各设篇幅上限；只由主 Agent 写入
@@ -331,13 +334,14 @@ async function runContentWrite(
       requestId,
     );
   }
-  // L1 多一个 retire：撤回一条既有原子认识，不产生新认识（当前行移除，历史保留）。
-  // 纠正（新认识取代旧认识）仍用 create + withdraws。
-  if (layer === "l1" && req.change !== "create" && req.change !== "retire") {
+  // L1 多 retire 与 retag：前者撤回一条既有原子认识（当前行移除，历史保留），
+  // 后者只改归属元数据（正文不可改）。纠正（新认识取代旧认识）仍用 create + withdraws。
+  if (layer === "l1" && req.change !== "create" && req.change !== "retire"
+      && req.change !== "retag") {
     return fail(
       400,
-      `append_only_layer: ${layer} 只支持 create（新增认识）与 retire（撤回既有认识）；` +
-        "纠正请再追加一条带 l1_source/withdraws 的 L1",
+      `append_only_layer: ${layer} 只支持 create（新增认识）、retire（撤回既有认识）` +
+        "与 retag（只改归属元数据）；纠正请再追加一条带 l1_source/withdraws 的 L1",
       requestId,
     );
   }
@@ -387,8 +391,10 @@ async function runContentWrite(
   }
 
   // 7. Reconstruct the mutation from its EXACT baseline (never from "today's current").
-  //    L1 retire 不需要基线：它按 locator 解析当前版本（见 buildL1RetireMutation）。
-  const baseline = req.change === "create" || (layer === "l1" && req.change === "retire")
+  //    L1 retire / retag 不需要调用方给基线：两者都按 locator 解析当前版本
+  //    （见 buildL1RetireMutation / buildL1RetagMutation）。
+  const baseline = req.change === "create"
+    || (layer === "l1" && (req.change === "retire" || req.change === "retag"))
     ? null
     : await resolveBaseline(deps, layer, req.content_id!, req.expected_version_id!, scope);
   const mutations = [await buildMutation(req, deps, scope, baseline)];
@@ -440,6 +446,7 @@ async function resolveBaseline(
 
 function validateStructure(req: ContentWriteRequest): void {
   const l1Retire = req.layer === "l1" && req.change === "retire";
+  const l1Retag = req.layer === "l1" && req.change === "retag";
   if (req.change === "create") {
     if (req.expected_version_id !== undefined && req.expected_version_id !== null) {
       throw new ContentWriteRequestError(400, "expected_version_id must be null/absent for a new identity");
@@ -455,6 +462,23 @@ function validateStructure(req: ContentWriteRequest): void {
     // 撤回不写正文：正文由被撤回的那一版提供（Core 在 store 层取 prior）。
     if (typeof req.body === "string" && req.body.length > 0) {
       throw new ContentWriteRequestError(400, "body must be absent for an L1 retire（撤回不写新认识）");
+    }
+  } else if (l1Retag) {
+    // retag 只改归属：正文由当前版本提供，调用方给出正文就是想把这条路当 revise。
+    if (req.body !== undefined) {
+      throw new ContentWriteRequestError(
+        400,
+        "body must be absent for an L1 retag（retag 不改正文；要点正文请写新认识并用 withdraws 关联旧条目）",
+      );
+    }
+    if (req.content_id !== undefined) {
+      throw new ContentWriteRequestError(400, "content_id must be absent for an L1 retag（按 locator 定位当前版本）");
+    }
+    if (req.scene_name === undefined && req.type === undefined && req.priority === undefined) {
+      throw new ContentWriteRequestError(
+        400,
+        "retag needs at least one of scene_name / type / priority（否则没有要改的归属字段）",
+      );
     }
   } else {
     if (!req.content_id) throw new ContentWriteRequestError(400, "content_id is required to change an existing identity");
@@ -482,7 +506,19 @@ function validateStructure(req: ContentWriteRequest): void {
     if (req.locator === undefined) {
       throw new ContentWriteRequestError(400, "locator is required for an L1 write (the program-supplied record id)");
     }
-    if (l1Retire) {
+    if (l1Retag) {
+      // 归属之外的东西一律不接受：来源、撤回关系、来源消息、时间与用户元数据
+      // 都从当前版本逐字沿用，调用方覆盖它们就不是“改归属”了。
+      if (req.l1_source !== undefined || req.withdraws !== undefined
+          || req.source_message_ids !== undefined || req.timestamps !== undefined
+          || req.user_metadata !== undefined) {
+        throw new ContentWriteRequestError(
+          400,
+          "l1_source/withdraws/source_message_ids/timestamps/user_metadata do not apply to an L1 retag" +
+            "（只改归属字段，其余元数据原样保留）",
+        );
+      }
+    } else if (l1Retire) {
       // 撤回只按 locator 定位：来源、正文属性、撤回关系都不属于撤回本身。
       if (req.l1_source !== undefined || req.withdraws !== undefined || req.type !== undefined
           || req.priority !== undefined || req.scene_name !== undefined
@@ -708,6 +744,73 @@ async function buildL1RetireMutation(
   };
 }
 
+/**
+ * L1 retag：只改一条既有认识的归属元数据（scene_name / type / priority）。
+ *
+ * 正文、locator、content_id、版本链与其余元数据（l1_source、withdraws、
+ * user_metadata.note、source_refs、时间戳、session/task）都从**当前版本**取，
+ * 所以它不可能借这条路改认识内容——想改正文必须写新认识并 withdraws 关联旧条目。
+ * 版本层面它是一次 `revise`：CAS 用当前版本号，历史保留；归属没变时 store 判 no-op
+ * （`changed=false`），不会平白长出一个版本。
+ */
+async function buildL1RetagMutation(
+  req: ContentWriteRequest,
+  deps: ContentWriteDeps,
+  scope: HistoryScope,
+): Promise<VersionMutation> {
+  const store = deps.getStore();
+  const reader = store?.getContentHistory?.();
+  if (!reader) {
+    throw new ContentWriteRequestError(501, "history_unavailable: this store cannot resolve an L1 locator");
+  }
+  const auth = buildContentHistoryAuthFilter(deps.requestIsolation);
+  const resolved = reader.resolveLocatorAuthorized("l1", req.locator!, auth);
+  if (!resolved) {
+    throw new ContentWriteRequestError(
+      404,
+      `locator_not_found: ${req.locator} is not an in-scope L1 locator`,
+    );
+  }
+  if (req.expected_version_id !== undefined && req.expected_version_id !== null
+      && req.expected_version_id !== resolved.ref.version_id) {
+    throw new ContentWriteRequestError(
+      409,
+      `history_version_conflict: current version of ${req.locator} is ${resolved.ref.version_id}, ` +
+        `expected ${req.expected_version_id}`,
+    );
+  }
+  const current = await readVersionAsync(reader, {
+    layer: "l1",
+    content_id: resolved.ref.content_id,
+    version_id: resolved.ref.version_id,
+    scope: resolved.scope,
+  });
+  if (!current) {
+    throw new ContentWriteRequestError(
+      404,
+      `locator_not_found: ${req.locator} has no readable current version`,
+    );
+  }
+  const metadata: Record<string, unknown> = { ...(current.metadata ?? {}) };
+  if (req.scene_name !== undefined) metadata.scene_name = req.scene_name;
+  if (req.type !== undefined) metadata.type = req.type;
+  if (req.priority !== undefined) metadata.priority = req.priority;
+  return {
+    draft: {
+      layer: "l1",
+      content_id: resolved.ref.content_id,
+      locator: req.locator!,
+      scope,
+      body: current.body,
+      metadata,
+      state: "active",
+    },
+    expected_version_id: resolved.ref.version_id,
+    predecessors: [{ ...resolved.ref }],
+    change_kind: "revise",
+  };
+}
+
 async function buildMutation(
   req: ContentWriteRequest,
   deps: ContentWriteDeps,
@@ -736,6 +839,7 @@ async function buildMutation(
 
   if (req.layer === "l1") {
     if (req.change === "retire") return await buildL1RetireMutation(req, deps, scope);
+    if (req.change === "retag") return await buildL1RetagMutation(req, deps, scope);
     const metadata = await buildL1Metadata(req, deps, scope, baseline);
     return {
       draft: {
