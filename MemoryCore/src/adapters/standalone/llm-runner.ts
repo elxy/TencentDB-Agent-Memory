@@ -21,12 +21,15 @@ import path from "node:path";
 import { generateText, streamText, tool, stepCountIs, jsonSchema } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { report } from "../../core/report/reporter.js";
+import { resolveSafeLocalPath, UnsafeLocalPathError } from "../../core/storage/safe-local-path.js";
+import { evaluateFilePolicy, filePolicyDeniedResult } from "./memory-file-policy.js";
 import type {
   LLMRunner,
   LLMRunParams,
   LLMRunnerFactory,
   LLMRunnerCreateOptions,
   Logger,
+  MemoryFilePolicy,
 } from "../../core/types.js";
 import type { LLMUsage } from "../../core/report/metric-tracking-runner.js";
 
@@ -115,19 +118,116 @@ export interface StandaloneLLMConfig {
 // Sandboxed tool execution helpers
 // ============================
 
+/**
+ * Resolve a model-supplied relative path under `workspaceDir` using the shared
+ * strict resolver. Returns null when the path is rejected as a boundary
+ * violation; unexpected filesystem errors are re-thrown so they surface loudly
+ * instead of being silently reported as a sandbox escape.
+ */
 function resolveSandboxedPath(workspaceDir: string, relativePath: string): string | null {
-  const resolved = path.resolve(workspaceDir, relativePath);
-  if (!resolved.startsWith(path.resolve(workspaceDir))) {
-    return null;
+  try {
+    return resolveSafeLocalPath(workspaceDir, relativePath);
+  } catch (err) {
+    if (err instanceof UnsafeLocalPathError) return null;
+    throw err;
   }
-  return resolved;
+}
+
+/** Plain executor functions backing the sandboxed read/write/edit tools. */
+export interface SandboxedToolExecutors {
+  read(args: { path: string }): Promise<string>;
+  write(args: { path: string; content: string }): Promise<string>;
+  edit(args: { path: string; edits: Array<{ oldText: string; newText: string }> }): Promise<string>;
+}
+
+/**
+ * Build the sandboxed read/write/edit execution logic as plain async functions
+ * (no AI SDK wrapper) so it can be unit-tested directly. `createSandboxedTools`
+ * wraps these with `tool()`.
+ *
+ * Every path goes through `resolveSafeLocalPath` (see safe-local-path.ts) for
+ * strict relative-path validation, segment-aware containment, and symlink
+ * rejection in any existing ancestor. Those checks are best-effort and NOT a
+ * TOCTOU-safe OS sandbox — see the helper's security-model comment.
+ */
+export function createSandboxedToolExecutors(
+  workspaceDir: string,
+  logger?: Logger,
+  filePolicy?: MemoryFilePolicy,
+): SandboxedToolExecutors {
+  return {
+    async read(args: { path: string }): Promise<string> {
+      const resolved = resolveSandboxedPath(workspaceDir, args.path);
+      if (!resolved) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
+      const decision = filePolicy ? evaluateFilePolicy(filePolicy, "read", args.path) : null;
+      if (decision && !decision.allowed) return filePolicyDeniedResult(decision);
+      try {
+        const content = await fsPromises.readFile(resolved, "utf-8");
+        logger?.debug?.(`${TAG} read: "${args.path}" → ${content.length} chars`);
+        return content;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger?.warn?.(`${TAG} read failed: ${msg}`);
+        return JSON.stringify({ error: msg });
+      }
+    },
+
+    async write(args: { path: string; content: string }): Promise<string> {
+      const resolved = resolveSandboxedPath(workspaceDir, args.path);
+      if (!resolved) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
+      const decision = filePolicy ? evaluateFilePolicy(filePolicy, "write", args.path) : null;
+      if (decision && !decision.allowed) return filePolicyDeniedResult(decision);
+      try {
+        await fsPromises.mkdir(path.dirname(resolved), { recursive: true });
+        await fsPromises.writeFile(resolved, args.content, "utf-8");
+        logger?.debug?.(`${TAG} write: "${args.path}" → ${Buffer.byteLength(args.content, "utf8")} bytes`);
+        return JSON.stringify({ success: true });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger?.warn?.(`${TAG} write failed: ${msg}`);
+        return JSON.stringify({ error: msg });
+      }
+    },
+
+    async edit(args: { path: string; edits: Array<{ oldText: string; newText: string }> }): Promise<string> {
+      const resolved = resolveSandboxedPath(workspaceDir, args.path);
+      if (!resolved) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
+      const decision = filePolicy ? evaluateFilePolicy(filePolicy, "edit", args.path) : null;
+      if (decision && !decision.allowed) return filePolicyDeniedResult(decision);
+      if (!args.edits || args.edits.length === 0) return JSON.stringify({ error: "edits array cannot be empty." });
+      try {
+        let content = await fsPromises.readFile(resolved, "utf-8");
+        for (const edit of args.edits) {
+          if (!edit.oldText) return JSON.stringify({ error: "oldText cannot be empty." });
+          if (!content.includes(edit.oldText)) {
+            return JSON.stringify({ error: `oldText not found in file "${args.path}": ${edit.oldText.slice(0, 80)}` });
+          }
+          // Pass a replacer function so `$&`, `$'`, "$`", `$1`, `$$` in newText are
+          // inserted literally. A plain string replacement would expand them as
+          // special patterns -- `$'` (matched substring's suffix) duplicates the rest
+          // of the file on every edit, growing scene blocks exponentially.
+          content = content.replace(edit.oldText, () => edit.newText);
+        }
+        await fsPromises.writeFile(resolved, content, "utf-8");
+        logger?.debug?.(
+          `${TAG} edit: "${args.path}" → ${args.edits.length} replacement(s), ${Buffer.byteLength(content, "utf8")} bytes`,
+        );
+        return JSON.stringify({ success: true });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger?.warn?.(`${TAG} edit failed: ${msg}`);
+        return JSON.stringify({ error: msg });
+      }
+    },
+  };
 }
 
 // ============================
 // Tool definitions (Vercel AI SDK `tool()` format)
 // ============================
 
-function createSandboxedTools(workspaceDir: string, logger?: Logger) {
+function createSandboxedTools(workspaceDir: string, logger?: Logger, filePolicy?: MemoryFilePolicy) {
+  const exec = createSandboxedToolExecutors(workspaceDir, logger, filePolicy);
   return {
     read: tool({
       description: "Read the contents of a file at the given relative path.",
@@ -138,19 +238,7 @@ function createSandboxedTools(workspaceDir: string, logger?: Logger) {
         },
         required: ["path"],
       }),
-      execute: (async (args: { path: string }) => {
-        const resolved = resolveSandboxedPath(workspaceDir, args.path);
-        if (!resolved) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
-        try {
-          const content = await fsPromises.readFile(resolved, "utf-8");
-          logger?.debug?.(`${TAG} read: "${args.path}" → ${content.length} chars`);
-          return content;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger?.warn?.(`${TAG} read failed: ${msg}`);
-          return JSON.stringify({ error: msg });
-        }
-      }) as any,
+      execute: exec.read as any,
     }),
 
     write: tool({
@@ -163,20 +251,7 @@ function createSandboxedTools(workspaceDir: string, logger?: Logger) {
         },
         required: ["path", "content"],
       }),
-      execute: (async (args: { path: string; content: string }) => {
-        const resolved = resolveSandboxedPath(workspaceDir, args.path);
-        if (!resolved) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
-        try {
-          await fsPromises.mkdir(path.dirname(resolved), { recursive: true });
-          await fsPromises.writeFile(resolved, args.content, "utf-8");
-          logger?.debug?.(`${TAG} write: "${args.path}" → ${Buffer.byteLength(args.content, "utf8")} bytes`);
-          return JSON.stringify({ success: true });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger?.warn?.(`${TAG} write failed: ${msg}`);
-          return JSON.stringify({ error: msg });
-        }
-      }) as any,
+      execute: exec.write as any,
     }),
 
     edit: tool({
@@ -200,34 +275,7 @@ function createSandboxedTools(workspaceDir: string, logger?: Logger) {
         },
         required: ["path", "edits"],
       }),
-      execute: (async (args: { path: string; edits: Array<{ oldText: string; newText: string }> }) => {
-        const resolved = resolveSandboxedPath(workspaceDir, args.path);
-        if (!resolved) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
-        if (!args.edits || args.edits.length === 0) return JSON.stringify({ error: "edits array cannot be empty." });
-        try {
-          let content = await fsPromises.readFile(resolved, "utf-8");
-          for (const edit of args.edits) {
-            if (!edit.oldText) return JSON.stringify({ error: "oldText cannot be empty." });
-            if (!content.includes(edit.oldText)) {
-              return JSON.stringify({ error: `oldText not found in file "${args.path}": ${edit.oldText.slice(0, 80)}` });
-            }
-            // Pass a replacer function so `$&`, `$'`, "$`", `$1`, `$$` in newText are
-            // inserted literally. A plain string replacement would expand them as
-            // special patterns -- `$'` (matched substring's suffix) duplicates the rest
-            // of the file on every edit, growing scene blocks exponentially.
-            content = content.replace(edit.oldText, () => edit.newText);
-          }
-          await fsPromises.writeFile(resolved, content, "utf-8");
-          logger?.debug?.(
-            `${TAG} edit: "${args.path}" → ${args.edits.length} replacement(s), ${Buffer.byteLength(content, "utf8")} bytes`,
-          );
-          return JSON.stringify({ success: true });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger?.warn?.(`${TAG} edit failed: ${msg}`);
-          return JSON.stringify({ error: msg });
-        }
-      }) as any,
+      execute: exec.edit as any,
     }),
   };
 }
@@ -293,6 +341,16 @@ export class StandaloneLLMRunner implements LLMRunner {
     const effectiveEnableTools = params.enableTools ?? this.enableTools;
     const maxIterations = params.maxIterations ?? MAX_TOOL_ITERATIONS;
 
+    // A file policy is only meaningful for the runner-owned sandboxed tools.
+    // Arbitrary caller-provided tools execute outside the policy, so accepting
+    // them here would silently bypass it — reject the combination loudly.
+    if (params.filePolicy && callerProvidedTools && effectiveEnableTools) {
+      throw new Error(
+        `${TAG} refusing caller-provided tools while filePolicy is set ` +
+          `(policy bypass risk): [${Object.keys(params.tools!).join(", ")}]`,
+      );
+    }
+
     this.logger?.debug?.(
       `${TAG} run() start: taskId=${params.taskId}, model=${this.model}, ` +
       `tools=${effectiveEnableTools}${callerProvidedTools ? "(caller)" : ""}, timeout=${timeoutMs}ms`,
@@ -319,10 +377,10 @@ export class StandaloneLLMRunner implements LLMRunner {
       this.logger?.debug?.(`${TAG} Using caller-provided tools: [${Object.keys(tools!).join(", ")}]`);
     } else if (effectiveEnableTools && params.storage) {
       const { createStorageTools } = await import("./storage-tools.js");
-      tools = createStorageTools(params.storage, params.storagePrefix ?? "", this.logger);
+      tools = createStorageTools(params.storage, params.storagePrefix ?? "", this.logger, params.filePolicy);
       this.logger?.debug?.(`${TAG} Using storage-backed tools (prefix="${params.storagePrefix ?? ""}")`);
     } else if (effectiveEnableTools) {
-      tools = createSandboxedTools(workspaceDir, this.logger);
+      tools = createSandboxedTools(workspaceDir, this.logger, params.filePolicy);
     } else {
       tools = undefined; // pure-text task — never expose any tool to the model
     }
@@ -348,8 +406,15 @@ export class StandaloneLLMRunner implements LLMRunner {
           : {}),
         maxOutputTokens: maxTokens,
         abortSignal: combinedSignal,
+        // Pin retries to 0: the runner must make exactly one upstream request
+        // per run. A failing upstream (e.g. HTTP 500) must surface immediately
+        // instead of being retried by the AI SDK, which would multiply cost and
+        // hide fail-fast behaviour. Shared by both streamText and generateText.
+        maxRetries: 0,
         experimental_telemetry: {
-          isEnabled: true,
+          // Respect the standard OTEL kill-switch: OTEL_SDK_DISABLED=true turns
+          // the experimental AI SDK telemetry (and its OTel span emission) off.
+          isEnabled: process.env.OTEL_SDK_DISABLED !== "true",
           functionId: params.taskId,
           metadata: buildTelemetryMetadata(params),
         },

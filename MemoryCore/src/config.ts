@@ -39,6 +39,14 @@ export interface ExtractionConfig {
   enabled: boolean;
   /** Enable L1 smart dedup (default: true) */
   enableDedup: boolean;
+  /**
+   * Opt-in: let L1 dedup candidate recall cross session boundaries (default: false).
+   * When true, only the sessionId dimension is removed from the dedup isolation
+   * filter; teamId/userId/agentId/taskId are retained exactly. Requires at least
+   * one of teamId/userId/agentId to be present. This does not change write
+   * identities or L0 reads.
+   */
+  dedupAcrossSessions: boolean;
   /** Max memories per session (default: 20) */
   maxMemoriesPerSession: number;
   /** LLM model for extraction, format: "provider/model" (falls back to OpenClaw default model when omitted) */
@@ -61,6 +69,16 @@ export interface PersonaConfig {
   model?: string;
   /** Prompt family for L2/L3 prompts (default: chat; code prompts will be wired as they are added). */
   promptMode: MemoryPromptMode;
+  /**
+   * Explicit L2 scene-extraction system template (trusted operator config).
+   *
+   * When set it fully replaces the built-in L2 system prompt; the runtime then
+   * appends a minimal mandatory storage/provenance/file contract. Undefined
+   * preserves the built-in prompt byte-for-byte. Explicit null / non-string /
+   * blank values are rejected. There is intentionally NO length limit,
+   * truncation or compression applied to an explicit override.
+   */
+  sceneSystemTemplate?: string;
 }
 
 /** Pipeline trigger settings (L1→L2→L3 scheduling). */
@@ -397,6 +415,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
 
   // --- Extraction (L1) ---
   const extractionGroup = obj(c, "extraction");
+  const dedupAcrossSessions = resolveExtractionDedupAcrossSessions(extractionGroup);
 
   // --- Persona (L2/L3) ---
   const personaGroup = obj(c, "persona");
@@ -570,6 +589,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     extraction: {
       enabled: bool(extractionGroup, "enabled") ?? true,
       enableDedup: bool(extractionGroup, "enableDedup") ?? true,
+      dedupAcrossSessions,
       maxMemoriesPerSession: num(extractionGroup, "maxMemoriesPerSession") ?? 20,
       model: optStr(extractionGroup, "model"),
       promptMode: normalizePromptMode(str(extractionGroup, "promptMode"), globalPromptMode),
@@ -581,6 +601,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       sceneBackupCount: num(personaGroup, "sceneBackupCount") ?? 10,
       model: optStr(personaGroup, "model"),
       promptMode: normalizePromptMode(str(personaGroup, "promptMode"), globalPromptMode),
+      sceneSystemTemplate: resolveSystemTemplateConfig(personaGroup, "sceneSystemTemplate"),
     },
     pipeline: {
       everyNConversations: num(pipelineGroup, "everyNConversations") ?? 5,
@@ -708,6 +729,52 @@ function strArray(src: Record<string, unknown>, key: string): string[] | undefin
   const v = src[key];
   if (!Array.isArray(v)) return undefined;
   return v.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+/**
+ * Resolve `extraction.dedupAcrossSessions`.
+ *
+ * - absent → default false (session-scoped dedup, unchanged behaviour)
+ * - explicit boolean → that value
+ * - explicit non-boolean → fail-fast (malformed config is rejected, never
+ *   silently coerced to the default)
+ */
+function resolveExtractionDedupAcrossSessions(group: Record<string, unknown>): boolean {
+  const raw = group["dedupAcrossSessions"];
+  if (raw === undefined) return false;
+  if (typeof raw !== "boolean") {
+    throw new Error(
+      `invalid extraction.dedupAcrossSessions: ${JSON.stringify(raw)} (expected boolean)`,
+    );
+  }
+  return raw;
+}
+
+/**
+ * Resolve an explicit L2/L3 system-template override from `persona`.
+ *
+ * - absent (undefined) → undefined: the built-in system prompt is preserved
+ *   byte-for-byte.
+ * - non-blank string → the operator-supplied template, returned verbatim (no
+ *   trimming, length limit, truncation or compression is applied).
+ * - explicit null / non-string / blank string → fail-fast. Malformed operator
+ *   configuration is rejected rather than silently coerced to the default.
+ *
+ * The template is trusted operator configuration and is never sourced from
+ * memory payloads or model output.
+ */
+function resolveSystemTemplateConfig(
+  group: Record<string, unknown>,
+  key: "sceneSystemTemplate",
+): string | undefined {
+  const raw = group[key];
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    throw new Error(
+      `invalid persona.${key}: ${JSON.stringify(raw)} (expected a non-blank string)`,
+    );
+  }
+  return raw;
 }
 
 const VALID_STRATEGIES: RecallConfig["strategy"][] = ["embedding", "keyword", "hybrid"];

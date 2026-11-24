@@ -20,7 +20,7 @@ import path from "node:path";
 import { parseConfig } from "../../config.js";
 import type { MemoryTdaiConfig } from "../../config.js";
 import { performAutoCapture } from "../hooks/auto-capture.js";
-import { createPipeline, createL2Runner, createL3Runner } from "../../utils/pipeline-factory.js";
+import { createPipeline, createL2Runner } from "../../utils/pipeline-factory.js";
 import type { PipelineInstance, PipelineLogger } from "../../utils/pipeline-factory.js";
 import { readManifest, writeManifest } from "../../utils/manifest.js";
 import { StandaloneLLMRunnerFactory } from "../../adapters/standalone/llm-runner.js";
@@ -115,15 +115,7 @@ async function createSeedPipeline(opts: SeedRuntimeOptions): Promise<{ pipeline:
     llmRunner: l2l3LlmRunner,
   }));
 
-  // Wire L3 runner via shared factory (same logic as index.ts live runtime)
-  pipeline.scheduler.setL3Runner(createL3Runner({
-    pluginDataDir: outputDir,
-    cfg,
-    openclawConfig,
-    vectorStore: pipeline.vectorStore,
-    logger,
-    llmRunner: l2l3LlmRunner,
-  }));
+  // 2026-10-12：Core 自动生成 L3（persona）已撤掉，不再接 L3 runner。
 
   return { pipeline, cfg };
 }

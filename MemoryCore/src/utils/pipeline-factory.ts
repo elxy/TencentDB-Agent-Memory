@@ -1,7 +1,7 @@
 /**
  * Pipeline factory: shared infrastructure for creating and wiring
  * MemoryPipelineManager instances with VectorStore, EmbeddingService,
- * L1 runner, L2 runner, L3 runner, and persister.
+ * L1 runner, L2 runner, and persister (L3 auto-generation removed 2026-10-12).
  *
  * Used by both:
  * - `index.ts` (live plugin runtime)
@@ -15,7 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { MemoryTdaiConfig } from "../config.js";
 import { MemoryPipelineManager } from "./pipeline-manager.js";
-import type { L2Runner, L3Runner } from "./pipeline-manager.js";
+import type { L2Runner } from "./pipeline-manager.js";
 import { SessionFilter } from "./session-filter.js";
 import { extractL1Memories } from "../core/record/l1-extractor.js";
 import { readConversationMessagesGroupedBySessionId } from "../core/conversation/l0-recorder.js";
@@ -35,8 +35,14 @@ import {
   buildMemoryGenerationRefId,
   type MemoryGenerationLog,
 } from "../core/memory-generation-log/types.js";
+import {
+  buildSystemPromptGenerationRef,
+  selectChangedProfiles,
+  snapshotLocalProfiles,
+} from "../core/memory-generation-log/diagnostics.js";
 import { writeGenerationProvenanceBestEffort } from "../core/memory-generation-log/best-effort.js";
 import { LocalStorageBackend } from "../core/storage/local-backend.js";
+import { recoverLocalPublishes, getLocalPublishRootOf } from "../core/storage/local-published-storage.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import {
   readManifest,
@@ -46,8 +52,79 @@ import {
   type Manifest,
 } from "./manifest.js";
 import { SceneExtractor } from "../core/scene/scene-extractor.js";
-import { PersonaTrigger } from "../core/persona/persona-trigger.js";
-import { PersonaGenerator } from "../core/persona/persona-generator.js";
+import { buildContentSourcesBeforeCommit } from "../core/content/sources.js";
+import { L1HistoryRun, ProfileHistoryRun } from "../core/content/generation-history.js";
+import { buildContentHistoryAuthFilter, profileHistoryScope } from "../core/content/history-reader.js";
+import { LocalContentHistory } from "../core/storage/local-content-history.js";
+
+// ============================
+// Content history integration
+// ============================
+
+/**
+ * Explicit, program-construction-only content-history wiring.
+ *
+ * Default off: when omitted the pipeline runs the legacy path byte-for-byte
+ * unchanged. When a capability is requested but missing, the runner FAILS FAST
+ * instead of silently degrading to legacy writes.
+ */
+export interface ContentHistoryPipelineOptions {
+  /** L1: formal versions for extracted memories (needs a history-enabled store). */
+  l1?: boolean;
+  /** L2/L3: formal versions for the profile publish root. */
+  profiles?: boolean;
+}
+
+/**
+ * Open (and enable, once) the formal L2/L3 history for a profile publish root
+ * and bind the exact input reader. Throws when the root cannot host a bundle or
+ * the store reader is unavailable — history never silently degrades.
+ */
+async function buildProfileHistoryRun(args: {
+  kind: "l2" | "l3";
+  dataDir: string;
+  storage: StorageAdapter;
+  vectorStore?: IMemoryStore;
+  teamId?: string;
+  userId?: string;
+  agentId?: string;
+  taskId?: string;
+  logger: PipelineLogger;
+}): Promise<ProfileHistoryRun> {
+  const publishRoot = getLocalPublishRootOf(args.storage.getBackend());
+  if (!publishRoot) {
+    throw new Error(
+      `${TAG} content history for ${args.kind} requires a local publish root; ` +
+        `this backend cannot publish an immutable bundle and generation is refused`,
+    );
+  }
+  const history = new LocalContentHistory(publishRoot);
+  const scope = profileHistoryScope({ teamId: args.teamId, userId: args.userId, agentId: args.agentId });
+  if (!(await history.isEnabled())) {
+    await history.enableHistory({ scope });
+  }
+  const reader = args.vectorStore?.getContentHistory?.();
+  if (!reader) {
+    throw new Error(`${TAG} content history for ${args.kind} requires the store content-history reader`);
+  }
+  return new ProfileHistoryRun({
+    kind: args.kind,
+    history,
+    reader,
+    scope,
+    auth: buildContentHistoryAuthFilter({
+      teamId: args.teamId,
+      userId: args.userId,
+      agentId: args.agentId,
+      taskId: args.taskId,
+    }),
+    logger: args.logger,
+  });
+}
+
+// Re-export so callers integrating the reliability generator can find the hook
+// at the pipeline seam too.
+export { buildContentSourcesBeforeCommit };
 import {
   DEFAULT_PROFILE_SCOPE,
   buildProfileIsolationScope,
@@ -145,6 +222,16 @@ function profileOptionsForScope(scope: string): ProfileScopeOptions | undefined 
 
 async function discoverProfileScopes(dataDir: string, storage: StorageAdapter | undefined, logger: Logger): Promise<string[]> {
   const scopes = new Set<string>();
+  const { getLocalPublishRootOf } = await import("../core/storage/local-published-storage.js");
+  const localRoot = storage ? getLocalPublishRootOf(storage.getBackend()) : dataDir;
+  if (localRoot) {
+    const { resolveSafeLocalPath } = await import("../core/storage/safe-local-path.js");
+    try {
+      const entries = await fs.promises.readdir(resolveSafeLocalPath(localRoot, "profiles"), {withFileTypes:true});
+      for (const entry of entries) { if (entry.isSymbolicLink()) throw new Error("Symlink profile scope rejected"); if (entry.isDirectory()) scopes.add(decodeURIComponent(entry.name)); }
+    } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+    return [...scopes].sort();
+  }
   if (storage) {
     try {
       const result = await storage.getBackend().listObjects("profiles/", { recursive: true, maxKeys: 10000 });
@@ -195,6 +282,8 @@ export interface PipelineFactoryOptions {
   l1LlmRunner?: import("../core/types.js").LLMRunner;
   /** Host-neutral LLM runner for L2/L3 (tool-call enabled, enableTools=true). */
   l2l3LlmRunner?: import("../core/types.js").LLMRunner;
+  /** Optional content-history wiring (default off). */
+  contentHistory?: ContentHistoryPipelineOptions;
 }
 
 // ============================
@@ -401,6 +490,8 @@ export function createL1Runner(opts: {
    * service 模式下必须提供，否则同 instance 的多节点并发会丢失 L1 游标。
    */
   checkpointLock?: import("./checkpoint.js").CheckpointLockOptions;
+  /** Optional content-history wiring (L1 formal commits). */
+  contentHistory?: ContentHistoryPipelineOptions;
 }): (params: { sessionKey: string }) => Promise<{
   processedCount: number;
   storedCount: number;
@@ -412,6 +503,15 @@ export function createL1Runner(opts: {
 }> {
   const { pluginDataDir, cfg, openclawConfig, vectorStore, embeddingService, logger, getInstanceId, llmRunner, storage, checkpointLock } = opts;
   const config = openclawConfig as Record<string, unknown> | undefined;
+  const l1HistoryEnabled = opts.contentHistory?.l1 === true;
+  if (l1HistoryEnabled) {
+    if (!vectorStore?.commitContentChanges || vectorStore.isContentHistoryEnabled?.() !== true || !vectorStore.getContentHistory?.()) {
+      throw new Error(
+        `${TAG} [l1] content history is requested but the store does not expose it; ` +
+          `refusing to fall back to legacy writes`,
+      );
+    }
+  }
 
   return async ({ sessionKey }) => {
     if (!config && !llmRunner) {
@@ -601,6 +701,19 @@ export function createL1Runner(opts: {
           `${TAG} [l1] Group sessionId=${group.sessionId || "(empty)"}: ${group.messages.length} messages`,
         );
 
+        const l1History = l1HistoryEnabled
+          ? new L1HistoryRun({
+              store: vectorStore!,
+              reader: vectorStore!.getContentHistory?.()!,
+              teamId: group.teamId,
+              userId: group.userId,
+              agentId: group.agentId,
+              taskId: group.taskId,
+              sessionKey,
+              logger,
+            })
+          : undefined;
+
         const l1Result = await extractL1Memories({
           messages: group.messages,
           sessionKey,
@@ -613,6 +726,7 @@ export function createL1Runner(opts: {
           config,
           options: {
             enableDedup: cfg.extraction.enableDedup,
+            dedupAcrossSessions: cfg.extraction.dedupAcrossSessions,
             maxMemoriesPerSession: cfg.extraction.maxMemoriesPerSession,
             model: cfg.extraction.model,
             promptMode: cfg.extraction.promptMode,
@@ -627,12 +741,23 @@ export function createL1Runner(opts: {
             conflictRecallTopK: cfg.embedding.conflictRecallTopK,
             embeddingTimeoutMs: cfg.embedding.captureTimeoutMs ?? cfg.embedding.timeoutMs,
             llmRunner,
+            history: l1History,
           },
           logger,
           instanceId: getInstanceId?.(),
           storage,
         });
 
+        // A failed extraction must NOT be recorded as progress: throwing here
+        // leaves the L1 cursor/checkpoint untouched so the same input is retried
+        // rather than being silently marked processed. Any memory that was
+        // committed before the failure stays committed (idempotent operation ids
+        // make a retry a replay, not a duplicate identity).
+        if (!l1Result.success) {
+          throw new Error(
+            `${TAG} [l1] extraction reported success=false; refusing to advance the L1 cursor/checkpoint`,
+          );
+        }
         totalExtracted += l1Result.extractedCount;
         totalStored += l1Result.storedCount;
         if (l1Result.storedCount > 0) {
@@ -716,8 +841,17 @@ export function createL2Runner(opts: {
    * service 模式下必须提供，否则同instance 的多节点并发会丢失计数器修复结果。
    */
   checkpointLock?: import("./checkpoint.js").CheckpointLockOptions;
+  /** Optional content-history wiring (L2 formal versions). */
+  contentHistory?: ContentHistoryPipelineOptions;
 }): L2Runner {
-  const { pluginDataDir, cfg, openclawConfig, vectorStore, logger, instanceId, llmRunner, storage, checkpointLock } = opts;
+  const { pluginDataDir, cfg, openclawConfig, vectorStore, logger, instanceId, llmRunner, storage: suppliedStorage, checkpointLock, contentHistory } = opts;
+  const storage = suppliedStorage ?? new StorageAdapter(new LocalStorageBackend(pluginDataDir));
+  // History mode makes the formal content-history planner the ONE authority that
+  // writes the source relation into the published bundle. The legacy sidecar
+  // hook must NOT run alongside it: it would pre-write the (renamed) target path
+  // and the planner's rename mutation would then produce two entries for the
+  // same `(layer, path)` → `duplicate key`. Legacy mode keeps the hook unchanged.
+  const profilesHistoryEnabled = contentHistory?.profiles === true;
   let profileBaseline = new Map<string, { version: number; contentMd5: string; createdAtMs: number }>();
 
   return async (sessionKey: string, cursor?: string) => {
@@ -803,6 +937,29 @@ export function createL2Runner(opts: {
         ? await pullProfilesToLocal(groupDataDir, vectorStore, logger, groupStorage, groupProfileOptions)
         : profileBaseline;
 
+      // Local, per-generation baseline for the provenance diff below.
+      // `groupBaseline` can be empty when the store has no profile-pull
+      // capability (e.g. SQLite) — diffing against it would mark every local
+      // file as "changed this round". The local snapshot always reflects the
+      // files this generation actually started from.
+      const preGenerationBaseline = snapshotLocalProfiles(
+        await listLocalProfiles(groupDataDir, groupStorage, groupProfileOptions),
+      );
+
+      const profileHistory = contentHistory?.profiles === true
+        ? await buildProfileHistoryRun({
+            kind: "l2",
+            dataDir: groupDataDir,
+            storage: groupStorage ?? storage,
+            vectorStore,
+            teamId: ctx.teamId,
+            userId: ctx.userId,
+            agentId: ctx.agentId,
+            taskId: ctx.taskId,
+            logger,
+          })
+        : undefined;
+
       const extractor = new SceneExtractor({
         dataDir: groupDataDir,
         config: openclawConfig!,
@@ -813,6 +970,7 @@ export function createL2Runner(opts: {
           agentId: ctx.agentId,
           layer: "l2",
         })),
+        systemTemplate: cfg.persona.sceneSystemTemplate,
         maxScenes: cfg.persona.maxScenes,
         sceneBackupCount: cfg.persona.sceneBackupCount,
         logger,
@@ -821,7 +979,13 @@ export function createL2Runner(opts: {
         storage: groupStorage,
         // langfuse: 透传身份四元组，UI 上可按 user/session 列过滤
         traceContext: { teamId: ctx.teamId, userId: ctx.userId, agentId: ctx.agentId, sessionId: ctx.sessionId },
-      });
+        // Integration hook (see buildContentSourcesBeforeCommit): the reliability
+        // generator must call this inside its working view, before publishing
+        // the changed scene files, and abort the publication if it throws.
+        // Disabled in history mode (the planner owns the source sidecar then).
+        beforeCommit: profilesHistoryEnabled ? undefined : buildContentSourcesBeforeCommit(logger),
+        history: profileHistory,
+      } as ConstructorParameters<typeof SceneExtractor>[0]);
 
       const memories = groupRecords.map((r) => ({
         content: r.content,
@@ -841,7 +1005,8 @@ export function createL2Runner(opts: {
         layer: "l2",
       }));
       const extractResult = await extractor.extract(memories);
-      if (!(extractResult.success && extractResult.memoriesProcessed > 0)) continue;
+      if (!extractResult.success) throw new Error(`L2 generation failed: ${extractResult.error ?? "unknown"}`);
+      if (extractResult.memoriesProcessed <= 0) continue;
       if (extractResult.emptyExtraction) {
         anyEmptyExtraction = true;
         logger.warn(`${TAG} [L2] Extraction produced no file changes (empty run), skipping checkpoint increment`);
@@ -870,13 +1035,20 @@ export function createL2Runner(opts: {
 
       const l2FinishedAt = Date.now();
       const l2PromptRef = buildPromptGenerationRef(resolvedL2Prompt, "l2");
-      let changedProfiles = (await listLocalProfiles(groupDataDir, groupStorage, groupProfileOptions))
-        .filter((profile) => groupBaseline.get(profile.id)?.contentMd5 !== profile.contentMd5 || !groupBaseline.has(profile.id));
+      const l2EffectiveSystemPrompt = extractor.getLastEffectiveSystemPrompt();
+      // Keep syncing every profile that must reach the store. The sync result
+      // is intentionally NOT used to describe this generation: it mixes L2/L3
+      // rows and reflects the store baseline, not what this run produced.
       if (vectorStore && supportsProfileSyncWrite(vectorStore)) {
-        changedProfiles = (await syncLocalProfilesToStore(
+        await syncLocalProfilesToStore(
           groupDataDir, vectorStore, groupBaseline, logger, groupStorage, groupProfileOptions,
-        )) ?? changedProfiles;
+        );
       }
+      const changedProfiles = selectChangedProfiles(
+        preGenerationBaseline,
+        await listLocalProfiles(groupDataDir, groupStorage, groupProfileOptions),
+        "l2",
+      );
       if (changedProfiles.length === 0) {
         logger.debug?.(`${TAG} [L2] No changed Scene profiles, skipping generation provenance`);
         await checkpoint.incrementScenesProcessed();
@@ -900,6 +1072,9 @@ export function createL2Runner(opts: {
         session_id: ctx.sessionId,
         task_id: ctx.taskId,
         prompt: l2PromptRef,
+        system_prompt: l2EffectiveSystemPrompt
+          ? buildSystemPromptGenerationRef(l2EffectiveSystemPrompt, resolvedL2Prompt)
+          : undefined,
         anchor_memory_id: changedProfiles[0]?.id,
         input_refs: groupRecords.map((record) => ({ layer: "l1", record_id: record.id })),
         output_refs: changedProfiles.map((profile) => ({ layer: "l2", record_id: profile.id })),
@@ -939,182 +1114,12 @@ export function createL2Runner(opts: {
 }
 
 // ============================
-// L3 Runner factory
+// L3 Runner factory — 已撤掉（2026-10-12）
 // ============================
-
-/**
- * Create the standard L3 runner function (persona generation).
- *
- * Uses PersonaTrigger to check if generation is needed, then runs
- * PersonaGenerator. Used by both `index.ts` and `seed-runtime.ts`.
- */
-export function createL3Runner(opts: {
-  pluginDataDir: string;
-  cfg: MemoryTdaiConfig;
-  openclawConfig: unknown;
-  vectorStore?: IMemoryStore;
-  logger: PipelineLogger;
-  instanceId?: string;
-  /** Host-neutral LLM runner for L3 persona generation (standalone/gateway mode). Must have enableTools=true. */
-  llmRunner?: import("../core/types.js").LLMRunner;
-  /** StorageAdapter for file operations (COS/local). */
-  storage?: StorageAdapter;
-}): L3Runner {
-  const { pluginDataDir, cfg, openclawConfig, vectorStore, logger, instanceId, llmRunner, storage } = opts;
-
-  return async () => {
-    const scopes = await discoverProfileScopes(pluginDataDir, storage, logger);
-    const executionScopes = scopes.length > 0 ? scopes : [DEFAULT_PROFILE_SCOPE];
-    let generatedAny = false;
-    const l3PromptTargets = executionScopes.map((scope) => {
-      // The default scope ("global") carries no team/agent, so parsing yields
-      // undefined — a prompt target with both dimensions unset, which is the
-      // right lookup key for it.
-      const isolation = parseProfileIsolationScope(scope) ?? {};
-      return { teamId: isolation.teamId, agentId: isolation.agentId, layer: "l3" as const };
-    });
-    const l3Prompts = await resolveMemoryPrompts(vectorStore, l3PromptTargets);
-
-    for (const scope of executionScopes) {
-      const scopedDir = scopedDataDirForScope(pluginDataDir, scope);
-      const scopedStore = scopedStorageForScope(storage, scope);
-      const profileOptions = profileOptionsForScope(scope);
-
-      const trigger = new PersonaTrigger({
-        dataDir: scopedDir,
-        interval: cfg.persona.triggerEveryN,
-        logger,
-        storage: scopedStore,
-      });
-
-      const { should, reason } = await trigger.shouldGenerate();
-      if (!should) {
-        logger.debug?.(`${TAG} [L3] Persona generation not needed (scope=${scope})`);
-        continue;
-      }
-
-      if (!openclawConfig && !llmRunner) {
-        logger.warn(`${TAG} [L3] No OpenClaw config and no LLM runner, skipping persona generation`);
-        return;
-      }
-
-      // Guard: no scene files → nothing to generate from. Skip without marking
-      // checkpoint so cold-start trigger remains available for the next attempt.
-      const { readSceneIndex } = await import("../core/scene/scene-index.js");
-      const sceneIndex = await readSceneIndex(scopedDir, scopedStore);
-      if (sceneIndex.length === 0) {
-        logger.info(`${TAG} [L3] No scene files available for scope=${scope}, skipping (checkpoint unchanged)`);
-        continue;
-      }
-
-      // Pull remote profiles to establish fresh baseline before generation.
-      // This ensures syncLocalProfilesToStore() has correct baselineVersion
-      // for the optimistic-lock check instead of defaulting to 0.
-      let profileBaseline = new Map<string, { version: number; contentMd5: string; createdAtMs: number }>();
-      if (vectorStore?.pullProfiles && !vectorStore.isDegraded()) {
-        profileBaseline = await pullProfilesToLocal(scopedDir, vectorStore, logger, scopedStore, profileOptions);
-      }
-
-      logger.info(`${TAG} [L3] Starting persona generation: ${reason} (scope=${scope})`);
-      // 反解 scope 拿回 teamId/userId/agentId/sessionId 给 langfuse trace 用。
-      // 默认 scope ("global") 解不出维度，按空 isolation 处理。
-      const scopeIsolation = parseProfileIsolationScope(scope) ?? {};
-      const l3StartMs = Date.now();
-      const resolvedL3Prompt = l3Prompts.get(memoryPromptResolveKey({
-        teamId: scopeIsolation.teamId,
-        agentId: scopeIsolation.agentId,
-        layer: "l3",
-      }));
-      const generator = new PersonaGenerator({
-        dataDir: scopedDir,
-        config: openclawConfig,
-        model: cfg.persona.model,
-        promptMode: cfg.persona.promptMode,
-        memoryPrompt: resolvedL3Prompt,
-        backupCount: cfg.persona.backupCount,
-        logger,
-        instanceId,
-        llmRunner,
-        storage: scopedStore,
-        traceContext: scopeIsolation,
-      });
-      const genResult = await generator.generateLocalPersona(reason);
-
-      const checkpoint = new CheckpointManager(scopedDir, logger, scopedStore);
-      const cp = await checkpoint.read();
-      const personaMarker = cp.total_processed;
-
-      if (!genResult) {
-        logger.info(`${TAG} [L3] Persona generation skipped (no changes, scope=${scope})`);
-        await checkpoint.markPersonaGenerated(personaMarker);
-        continue;
-      }
-
-      const l3FinishedAt = Date.now();
-      const l3PromptRef = buildPromptGenerationRef(resolvedL3Prompt, "l3");
-      let changedProfiles = (await listLocalProfiles(scopedDir, scopedStore, profileOptions))
-        .filter((profile) => profileBaseline.get(profile.id)?.contentMd5 !== profile.contentMd5 || !profileBaseline.has(profile.id));
-      if (vectorStore && supportsProfileSyncWrite(vectorStore)) {
-        changedProfiles = (await syncLocalProfilesToStore(
-          scopedDir, vectorStore, profileBaseline, logger, scopedStore, profileOptions,
-        )) ?? changedProfiles;
-      }
-      if (changedProfiles.length === 0) {
-        logger.debug?.(`${TAG} [L3] No changed Persona profiles, skipping generation provenance`);
-        await checkpoint.markPersonaGenerated(personaMarker);
-        generatedAny = true;
-        continue;
-      }
-      const l3Identity = buildGenerationLogIdentity("l3", l3FinishedAt, changedProfiles[0]?.id);
-      const l3Provenance = buildGenerationProvenance(l3Identity, l3PromptRef);
-      const rootStorage = storage ?? new StorageAdapter(new LocalStorageBackend(pluginDataDir));
-      const l3Log: MemoryGenerationLog = {
-        schema_version: 1,
-        log_id: l3Identity.logId,
-        generation_id: l3Identity.generationId,
-        instance_id: instanceId ?? "standalone",
-        layer: "l3",
-        status: "succeeded",
-        team_id: scopeIsolation.teamId,
-        agent_id: scopeIsolation.agentId,
-        user_id: scopeIsolation.userId,
-        session_id: scopeIsolation.sessionId,
-        prompt: l3PromptRef,
-        anchor_memory_id: changedProfiles[0]?.id,
-        input_refs: sceneIndex.map((scene) => ({ layer: "l2", record_id: scene.filename })),
-        output_refs: changedProfiles.map((profile) => ({ layer: "l3", record_id: profile.id })),
-        model: cfg.persona.model,
-        prompt_mode: cfg.persona.promptMode,
-        started_at_ms: l3StartMs,
-        finished_at_ms: l3FinishedAt,
-        latency_ms: l3FinishedAt - l3StartMs,
-      };
-      const l3LogStore = new MemoryGenerationLogStore(rootStorage, instanceId ?? "standalone");
-      await writeGenerationProvenanceBestEffort({
-        layer: "l3",
-        logger,
-        writeLog: () => l3LogStore.write(l3Log, l3Identity.key),
-        writeRefs: vectorStore?.upsertMemoryGenerationRefs && changedProfiles.length > 0
-          ? () => vectorStore.upsertMemoryGenerationRefs!(changedProfiles.map((profile) => ({
-              generation_ref_id: buildMemoryGenerationRefId("l3", profile.id),
-              layer: "l3" as const,
-              memory_id: profile.id,
-              ...l3Provenance,
-              created_at_ms: l3FinishedAt,
-            })))
-          : undefined,
-      });
-
-      await checkpoint.markPersonaGenerated(personaMarker);
-      generatedAny = true;
-      logger.info(`${TAG} [L3] Persona generation succeeded (scope=${scope})`);
-    }
-
-    if (!generatedAny) {
-      logger.debug?.(`${TAG} [L3] No scoped persona generated`);
-    }
-  };
-}
+//
+// Core 自动生成 L3（原 persona 触发）已按收窄撤掉：L3 = 用户理解 / 信念 /
+// 当前重点三份文档，只由主 Agent 经 content/write 写入（docs/
+// memory-design-proposal.md §5.3）。这里不再提供 createL3Runner。
 
 // ============================
 // Pipeline Manager factory
@@ -1154,14 +1159,20 @@ export function createPipelineManager(
  * MemoryPipelineManager with L1 runner and persister attached.
  *
  * This is the high-level entry point used by both `index.ts` and `seed-runtime.ts`.
- * Callers should attach L2/L3 runners after creation using `createL2Runner()`
- * and `createL3Runner()` from this module.
+ * Callers should attach the L2 runner after creation using `createL2Runner()`
+ * from this module (the L3 auto-generator was removed 2026-10-12).
  */
 export async function createPipeline(opts: PipelineFactoryOptions): Promise<PipelineInstance> {
-  const { pluginDataDir, cfg, openclawConfig, logger, sessionFilter, l1LlmRunner } = opts;
+  const { pluginDataDir, cfg, openclawConfig, logger, sessionFilter, l1LlmRunner, contentHistory } = opts;
 
   // Ensure data directories exist
   initDataDirectories(pluginDataDir);
+
+  // Finish any local generation publish that was interrupted by a crash before
+  // proceeding. With the single-pointer design the pointer always names a
+  // complete bundle, so this only fails loudly on pointer/bundle corruption;
+  // a missing pointer (fresh install) is a normal no-op.
+  await recoverLocalPublishes(pluginDataDir, logger);
 
   // Initialize stores (once-async: reuses cached result if already initialized)
   const stores = await initStores(cfg, pluginDataDir, logger);
@@ -1179,6 +1190,7 @@ export async function createPipeline(opts: PipelineFactoryOptions): Promise<Pipe
     embeddingService,
     logger,
     llmRunner: l1LlmRunner,
+    contentHistory,
   }));
 
   // Wire persister

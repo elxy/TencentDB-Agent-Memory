@@ -5,9 +5,20 @@
  * Maps object keys to local file paths under a configurable root directory.
  */
 
-import { readFile, writeFile, mkdir, readdir, unlink, stat, rm, appendFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir, readdir, lstat, stat, unlink, rm, appendFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, dirname, sep, resolve } from "node:path";
+import { join, dirname } from "node:path";
+import { resolveSafeLocalPath } from "./safe-local-path.js";
+import {
+  readPublishedObject,
+  listPublishedObjects,
+  publishContentMutation,
+  openPublishedSnapshot,
+  isBundleContentKey,
+  isBundleContentPrefix,
+  type PublishedSnapshot,
+} from "./local-published-storage.js";
+import { LocalContentHistory } from "./local-content-history.js";
 import type {
   IStorageBackend,
   StorageObject,
@@ -58,37 +69,71 @@ export class LocalStorageBackend implements IStorageBackend {
    *   downstream tooling (sqlite, file managers).
    * - Keys with leading "/" or "\" (absolute paths).
    * - Keys whose resolved path falls outside rootDir (../ traversal).
+   * - Symlinked components (any existing ancestor, including rootDir itself).
+   *
+   * CR-6b fix: path containment is now segment-aware and symlinks are rejected
+   * via the shared `resolveSafeLocalPath` helper (safe-local-path.ts). That
+   * helper documents the explicit TOCTOU / non-OS-sandbox limitations of these
+   * checks — they defend against path-shaped attacks, not a hostile process
+   * concurrently mutating the filesystem.
    */
   private resolvePath(key: string): string {
     if (!key || typeof key !== "string") {
       throw new Error(`Invalid storage key: ${JSON.stringify(key)}`);
     }
-    if (key.includes("\0")) {
-      throw new Error("Storage key must not contain NUL character");
-    }
-    if (key.startsWith("/") || key.startsWith("\\")) {
-      throw new Error(`Storage key must be relative, got absolute: ${key}`);
-    }
+    return resolveSafeLocalPath(this.rootDir, key);
+  }
 
-    // Normalize key separators to OS path separators
-    const normalized = key.split("/").join(sep);
+  /**
+   * Resolve the sidecar `.meta.json` path for a key through the same strict
+   * boundary checks, so a symlinked/escaping sidecar is rejected too.
+   */
+  private resolveMetaPath(key: string): string {
+    return resolveSafeLocalPath(this.rootDir, `${key}.meta.json`);
+  }
 
-    // Compute the absolute resolved path; resolve() collapses ".." segments.
-    const absRoot = resolve(this.rootDir);
-    const absResolved = resolve(absRoot, normalized);
+  /**
+   * Expose the configured storage root. Used by the generation workspace to
+   * perform crash-safe local directory publishing (see
+   * `local-published-storage.ts`). Read-only escape hatch; callers must not
+   * mutate files under the root directly.
+   */
+  getRootDir(): string {
+    return this.rootDir;
+  }
 
-    // Ensure the resolved path stays inside rootDir. Append sep so that
-    // a key like "../rootDir2/foo" (which resolves to a sibling directory
-    // whose name happens to start with rootDir's name) is also rejected.
-    const rootWithSep = absRoot.endsWith(sep) ? absRoot : absRoot + sep;
-    if (absResolved !== absRoot && !absResolved.startsWith(rootWithSep)) {
-      throw new Error(`Path traversal rejected: key "${key}" escapes rootDir`);
-    }
+  /**
+   * Local publish capability: the absolute root under which this view's
+   * content bundle pointer lives. Consumed by the generation workspace and
+   * forwarded by scoped views (never parsed from private fields).
+   */
+  getLocalPublishRoot(): string {
+    return this.rootDir;
+  }
 
-    return absResolved;
+  /** Pin one revision for a whole read request (content + sources). */
+  async openPublishedSnapshot(): Promise<PublishedSnapshot> {
+    return openPublishedSnapshot(this.rootDir);
+  }
+
+  /**
+   * Formal L2/L3 content history for this root. Construct via this capability
+   * (not by string-building paths) so a scoped view resolves the same root the
+   * publish pointer lives under.
+   */
+  getContentHistory(clock?: () => Date): LocalContentHistory {
+    return new LocalContentHistory(this.rootDir, clock);
   }
 
   async putObject(key: string, content: string | Buffer, opts?: PutObjectOptions): Promise<void> {
+    if (isBundleContentKey(key)) {
+      // Content keys are published through an immutable bundle so readers never
+      // observe a half-written scene set. A single-key write rebuilds the full
+      // content set and switches the pointer once.
+      const buf = typeof content === "string" ? Buffer.from(content, "utf-8") : Buffer.from(content);
+      await publishContentMutation(this.rootDir, { writes: [{ key, content: buf }] }, { logger: this.logger });
+      return;
+    }
     const filePath = this.resolvePath(key);
     await mkdir(dirname(filePath), { recursive: true });
 
@@ -97,7 +142,7 @@ export class LocalStorageBackend implements IStorageBackend {
 
     // Store metadata as a sidecar .meta.json file if metadata is provided
     if (opts?.contentType || (opts?.metadata && Object.keys(opts.metadata).length > 0)) {
-      const metaPath = filePath + ".meta.json";
+      const metaPath = this.resolveMetaPath(key);
       await writeFile(metaPath, JSON.stringify({
         contentType: opts.contentType,
         metadata: opts.metadata,
@@ -113,6 +158,12 @@ export class LocalStorageBackend implements IStorageBackend {
    * so concurrent appendObject calls to the same key do not race.
    */
   async appendObject(key: string, content: string | Buffer): Promise<void> {
+    if (isBundleContentKey(key)) {
+      throw new Error(
+        `${TAG} appendObject is not supported for bundle content key ${JSON.stringify(key)} ` +
+          `(content is published as a whole immutable bundle)`,
+      );
+    }
     const filePath = this.resolvePath(key);
     await mkdir(dirname(filePath), { recursive: true });
 
@@ -126,7 +177,11 @@ export class LocalStorageBackend implements IStorageBackend {
   }
 
   async getObject(key: string): Promise<StorageObject | null> {
+    if (isBundleContentKey(key)) {
+      return readPublishedObject(this.rootDir, key);
+    }
     const filePath = this.resolvePath(key);
+    const metaPath = this.resolveMetaPath(key);
 
     if (!existsSync(filePath)) {
       return null;
@@ -141,7 +196,6 @@ export class LocalStorageBackend implements IStorageBackend {
       // Try to read sidecar metadata
       let contentType: string | undefined;
       let metadata: Record<string, string> | undefined;
-      const metaPath = filePath + ".meta.json";
       if (existsSync(metaPath)) {
         try {
           const metaRaw = await readFile(metaPath, "utf-8");
@@ -170,6 +224,9 @@ export class LocalStorageBackend implements IStorageBackend {
   }
 
   async exists(key: string): Promise<boolean> {
+    if (isBundleContentKey(key)) {
+      return (await readPublishedObject(this.rootDir, key)) !== null;
+    }
     const filePath = this.resolvePath(key);
     return existsSync(filePath);
   }
@@ -184,6 +241,9 @@ export class LocalStorageBackend implements IStorageBackend {
    * with "wo".
    */
   async listObjects(prefix: string, opts?: ListObjectsOptions): Promise<ListResult> {
+    if (isBundleContentPrefix(prefix)) {
+      return listPublishedObjects(this.rootDir, prefix, opts);
+    }
     const recursive = opts?.recursive ?? false;
 
     const lastSlash = prefix.lastIndexOf("/");
@@ -206,12 +266,16 @@ export class LocalStorageBackend implements IStorageBackend {
   }
 
   async deleteObject(key: string): Promise<void> {
+    if (isBundleContentKey(key)) {
+      await publishContentMutation(this.rootDir, { deletes: [key] }, { logger: this.logger });
+      return;
+    }
     const filePath = this.resolvePath(key);
+    const metaPath = this.resolveMetaPath(key);
 
     try {
       await unlink(filePath);
       // Also remove sidecar metadata if exists
-      const metaPath = filePath + ".meta.json";
       if (existsSync(metaPath)) {
         await unlink(metaPath);
       }
@@ -225,6 +289,13 @@ export class LocalStorageBackend implements IStorageBackend {
   }
 
   async deleteByPrefix(prefix: string): Promise<number> {
+    if (isBundleContentPrefix(prefix)) {
+      const listed = await listPublishedObjects(this.rootDir, prefix, { recursive: true, maxKeys: 100_000 });
+      const keys = listed.entries.filter((entry) => !entry.isDirectory).map((entry) => entry.key);
+      if (keys.length === 0) return 0;
+      await publishContentMutation(this.rootDir, { deletes: keys }, { logger: this.logger });
+      return keys.length;
+    }
     const dirPath = this.resolvePath(prefix);
 
     if (!existsSync(dirPath)) {
@@ -247,7 +318,8 @@ export class LocalStorageBackend implements IStorageBackend {
 
   /** Resolve the directory part of a key prefix; "" means the backend root. */
   private resolveDir(dirKey: string): string {
-    return dirKey ? this.resolvePath(dirKey) : resolve(this.rootDir);
+    // allowRoot: the empty prefix names the backend root itself.
+    return resolveSafeLocalPath(this.rootDir, dirKey, { allowRoot: true });
   }
 
   /**
@@ -273,7 +345,10 @@ export class LocalStorageBackend implements IStorageBackend {
       if (!item.startsWith(namePrefix)) continue;
 
       try {
-        const stats = await stat(join(dirPath, item));
+        // lstat (not stat) + explicit symlink skip: never follow a symlinked
+        // entry out of the root while listing.
+        const stats = await lstat(join(dirPath, item));
+        if (stats.isSymbolicLink()) continue;
         entries.push(stats.isDirectory()
           ? { key: `${dirKey}${item}/`, size: 0, lastModified: stats.mtime, isDirectory: true }
           : { key: `${dirKey}${item}`, size: stats.size, lastModified: stats.mtime, isDirectory: false });
@@ -311,7 +386,10 @@ export class LocalStorageBackend implements IStorageBackend {
       const itemKey = `${dirKey}${item}`;
 
       try {
-        const stats = await stat(fullPath);
+        // lstat + symlink skip: recursive walk must not descend through a
+        // symlinked directory that points outside the root.
+        const stats = await lstat(fullPath);
+        if (stats.isSymbolicLink()) continue;
 
         if (stats.isDirectory()) {
           const subKey = `${itemKey}/`;

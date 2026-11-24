@@ -7,21 +7,23 @@
  * Write strategy:
  * - JSONL is the append-only persistent store (source of truth for backup/recovery).
  * - VectorStore (SQLite) is the primary retrieval engine.
- * - On update/merge, old records are deleted from VectorStore in real-time;
- *   JSONL is append-only and cleaned up periodically by memory-cleaner.
+ * 2026-10-12 收窄：支持且仅支持 store（追加新认识）与 skip（跳过完全重复）。
+ * 纠正与矛盾以新 L1 追加表达，不再原地替代旧记录。
  *
- * Supports store (append), update, merge, and skip operations.
+ * Supports only store (append) and skip operations.
  *
  * v3: Aligned with Kenty's prompt output format — 3 memory types (persona/episodic/instruction),
  * numeric priority, scene_name, source_message_ids, metadata, timestamps.
  */
 
 import crypto from "node:crypto";
+import assert from "node:assert";
 import { DEFAULT_ISOLATION_ID, type IMemoryStore } from "../store/types.js";
 import type { EmbeddingService } from "../store/embedding.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { StoragePaths } from "../storage/types.js";
 import type { Logger } from "../types.js";
+import type { L1HistoryRun } from "../content/generation-history.js";
 
 // ============================
 // Types
@@ -111,29 +113,18 @@ export interface ExtractedMemory {
   scene_name: string;
 }
 
-export type DedupAction = "store" | "update" | "merge" | "skip";
-
 /**
- * v3 batch dedup decision — one per new memory, aligned with Kenty's conflict detection prompt.
- *
- * Key changes:
- * - `targetId` → `target_ids` (array, supports multi-target merge/update)
- * - Added `merged_type`, `merged_priority`, `merged_timestamps` for cross-type merge
+ * 2026-10-12 收窄（docs/memory-design-proposal.md §5.4）：自动提炼只新增
+ * （store），或跳过完全重复的内容（skip），不再由去重模型执行 update/merge
+ * 这类替代操作。相互矛盾的 L1 都保留，由读取时的模型判断，主 Agent 负责裁决。
  */
+export type DedupAction = "store" | "skip";
+
+/** Batch dedup decision — one per new memory: store it, or skip it as a duplicate. */
 export interface DedupDecision {
   /** Which new memory this decision is about */
   record_id: string;
   action: DedupAction;
-  /** IDs of existing records to replace/remove (for update/merge) */
-  target_ids: string[];
-  /** Merged/updated content text (for update/merge) */
-  merged_content?: string;
-  /** Best type after merge (for update/merge, may differ from original) */
-  merged_type?: MemoryType;
-  /** Priority after merge (for update/merge) */
-  merged_priority?: number;
-  /** Union of all related timestamps (for update/merge) */
-  merged_timestamps?: string[];
 }
 
 const TAG = "[memory-tdai][l1-writer]";
@@ -153,16 +144,14 @@ export function generateMemoryId(): string {
  * Write a memory record according to the dedup decision.
  *
  * - store: append new record
- * - update: remove target records + append updated record
- * - merge: remove target records + append merged record
  * - skip: do nothing
  *
- * v3: supports multi-target removal for update/merge.
- * v3.1: optional VectorStore + EmbeddingService for dual-write (JSONL + vector).
+ * 收窄后没有 update/merge 写入路径（2026-10-12）。
  */
 export async function writeMemory(params: {
   memory: ExtractedMemory;
   decision: DedupDecision;
+  dedupAcrossSessions?: boolean;
   baseDir: string;
   sessionKey: string;
   sessionId?: string;
@@ -178,45 +167,41 @@ export async function writeMemory(params: {
   embeddingService?: EmbeddingService;
   /** StorageAdapter for file operations (COS/local). Falls back to fs when absent. */
   storage?: StorageAdapter;
+  /**
+   * History-mode commit context. When present the write is a FORMAL content
+   * commit through `store.commitContentChanges` (current row + FTS/vector +
+   * immutable version in one transaction); the legacy append/upsertL1 path is
+   * bypassed entirely and any failure throws instead of degrading to
+   * "store as new".
+   */
+  history?: {
+    run: L1HistoryRun;
+    /** Deterministic commit time derived from the exact input versions. */
+    recordedAt: string;
+  };
 }): Promise<MemoryRecord | null> {
-  const { memory, decision, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, vectorStore, embeddingService, storage } = params;
+  const { memory, decision, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, vectorStore, embeddingService, storage, history } = params;
 
   if (decision.action === "skip") {
     logger?.debug?.(`${TAG} Skipping memory: ${memory.content.slice(0, 50)}...`);
     return null;
   }
+  // 2026-10-12 收窄：去重只有新增或跳过完全重复两条路，替代式 update/merge 已
+  // 撤掉。遗留调用方若仍传 update/merge，立即显式失败，绝不静默改成“新增一条”。
+  assert.ok(
+    decision.action === "store",
+    `${TAG} dedup_decision_invalid: 写入只允许 store/skip决策，非法 action：${String((decision as { action: unknown }).action)}`,
+  );
 
-  const now = new Date().toISOString();
+  const strict = params.dedupAcrossSessions === true;
+  if (strict && !teamId && !userId && !agentId) throw new Error("Cross-session write requires identity");
+  const now = history ? history.recordedAt : new Date().toISOString();
 
-  let nextVersion = 0;
-  if ((decision.action === "update" || decision.action === "merge") && decision.target_ids.length > 0 && vectorStore) {
-    try {
-      const existing = await vectorStore.queryL1Records({ recordIds: decision.target_ids });
-      const maxVersion = existing.reduce((max, row) => Math.max(max, row.version ?? 0), 0);
-      nextVersion = maxVersion + 1;
-    } catch (err) {
-      logger?.warn?.(`${TAG} Failed to read existing memory version, defaulting to v0: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  // Determine final content, type, priority based on action
-  let finalContent: string;
-  let finalType: MemoryType;
-  let finalPriority: number;
-  let finalTimestamps: string[];
-
-  if (decision.action === "merge" || decision.action === "update") {
-    finalContent = decision.merged_content ?? memory.content;
-    finalType = decision.merged_type ?? memory.type;
-    finalPriority = decision.merged_priority ?? memory.priority;
-    finalTimestamps = decision.merged_timestamps ?? [now];
-  } else {
-    // store
-    finalContent = memory.content;
-    finalType = memory.type;
-    finalPriority = memory.priority;
-    finalTimestamps = [now];
-  }
+  // 收窄后 dedup 只回答 store/skip：写入的始终是提炼出的原文。
+  const finalContent = memory.content;
+  const finalType: MemoryType = memory.type;
+  const finalPriority = memory.priority;
+  const finalTimestamps = [now];
 
   const record: MemoryRecord = {
     id: decision.record_id || generateMemoryId(),
@@ -229,7 +214,7 @@ export async function writeMemory(params: {
     timestamps: finalTimestamps,
     createdAt: now,
     updatedAt: now,
-    version: nextVersion,
+    version: 0,
     sessionKey,
     sessionId: sessionId || DEFAULT_ISOLATION_ID,
     taskId,
@@ -272,42 +257,42 @@ export async function writeMemory(params: {
     }
   };
 
-  if ((decision.action === "update" || decision.action === "merge") && decision.target_ids.length > 0) {
-    // Remove target records from VectorStore (real-time deletion for retrieval accuracy).
-    // JSONL is append-only — old records remain in files and are cleaned up periodically
-    // by memory-cleaner (which reconciles against VectorStore as source of truth).
-    if (vectorStore) {
+  if (history) {
+    // Formal history write. The embedding is computed first (easy-to-fail), then
+    // the record commits through the store entry. A failure here propagates: an
+    // uncommitted record must NEVER be resurrected as a new row, and the
+    // checkpoint must not advance on a partial success.
+    let embedding: Float32Array | undefined;
+    if (embeddingService) {
       try {
-        const deleteFilter = teamId || userId || agentId || sessionId
-          ? { teamId, userId, agentId, sessionId: sessionId || undefined, sessionKey }
-          : undefined;
-        if (deleteFilter) {
-          await vectorStore.deleteL1Batch(decision.target_ids, deleteFilter);
-        } else {
-          await vectorStore.deleteL1Batch(decision.target_ids);
-        }
-        logger?.debug?.(`${TAG} VectorStore: deleted ${decision.target_ids.length} target record(s) for ${decision.action}`);
-      } catch (err) {
+        embedding = await embeddingService.embed(record.content);
+      } catch (embedErr) {
         logger?.warn?.(
-          `${TAG} VectorStore delete failed for ${decision.action}: ${err instanceof Error ? err.message : String(err)}`,
+          `${TAG} [history] embedding failed for id=${record.id}; committing metadata/FTS only: ${embedErr instanceof Error ? embedErr.message : String(embedErr)}`,
         );
       }
     }
+    await history.run.commitRecord(record, embedding);
+    // JSONL is a non-authoritative mirror and cannot join the store transaction;
+    // write it only after the authoritative commit so it never represents an
+    // uncommitted candidate. A mirror failure is non-fatal.
     try {
       await appendRecord(JSON.stringify(record) + "\n");
     } catch (err) {
-      logger?.warn?.(`${TAG} JSONL append failed (non-fatal, VDB write continues): ${err instanceof Error ? err.message : String(err)}`);
+      logger?.warn?.(`${TAG} JSONL append after history commit failed (non-fatal, store committed): ${err instanceof Error ? err.message : String(err)}`);
     }
-    logger?.debug?.(`${TAG} ${decision.action} memory: removed [${decision.target_ids.join(",")}] from VectorStore → ${record.id}: ${finalContent.slice(0, 80)}...`);
-  } else {
-    // store: append a new line
-    try {
-      await appendRecord(JSON.stringify(record) + "\n");
-    } catch (err) {
-      logger?.warn?.(`${TAG} JSONL append failed (non-fatal, VDB write continues): ${err instanceof Error ? err.message : String(err)}`);
-    }
-    logger?.debug?.(`${TAG} Stored memory ${record.id}: ${finalContent.slice(0, 80)}...`);
+    logger?.debug?.(`${TAG} history ${decision.action} memory: ${record.id}: ${finalContent.slice(0, 80)}...`);
+    return record;
   }
+
+  // store: append a new line
+  try {
+    await appendRecord(JSON.stringify(record) + "\n");
+  } catch (err) {
+    if (strict) throw err;
+    logger?.warn?.(`${TAG} JSONL append failed (non-fatal, VDB write continues): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  logger?.debug?.(`${TAG} Stored memory ${record.id}: ${finalContent.slice(0, 80)}...`);
 
   // === Vector Store dual-write ===
   if (vectorStore) {
@@ -337,8 +322,10 @@ export async function writeMemory(params: {
       }
 
       const upsertOk = await vectorStore.upsertL1(record, embedding);
+      if (strict && !upsertOk) throw new Error("Authoritative memory write rejected");
       logger?.debug?.(`${TAG} [vec-dual-write] upsert result=${upsertOk} id=${record.id}`);
     } catch (err) {
+      if (strict) throw err;
       // Vector write failure should NOT block the main JSONL write
       logger?.warn?.(
         `${TAG} [vec-dual-write] FAILED (JSONL already written) id=${record.id}: ${err instanceof Error ? err.message : String(err)}`,

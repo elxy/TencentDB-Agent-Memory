@@ -8,12 +8,15 @@
  * so it can ONLY operate on .md scene files. System files (checkpoint,
  * scene_index, persona.md) are physically invisible to the LLM.
  *
- * Flow:
+ * Flow (2026-10-12 收窄):
  *   1. Backup + load scene index + build summaries
  *   2. Assemble extraction prompt with memories + scene context
  *   3. Run via CleanContextRunner (tools enabled, sandboxed to scene_blocks/)
- *   4. Cleanup: remove soft-deletes, sync index, update navigation
- *   5. Parse LLM text output for out-of-band persona update signals
+ *   4. Cleanup: remove soft-deletes, sync index, atomic publish
+ *
+ * 收窄：不再维护 persona.md 导航（L3 三份文档只由主 Agent 写入）；不再有
+ * out-of-band persona 更新信号与 SCENE_OPERATIONS 声明通道；"改名/合并/拆分"
+ * 专题就是写新文件 + 把旧文件显式写为 [DELETED]，按名称+时间读取。
  */
 
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
@@ -21,8 +24,7 @@ import { CheckpointManager } from "../../utils/checkpoint.js";
 import { BackupManager } from "../../utils/backup.js";
 import { readSceneIndex, syncSceneIndex } from "../scene/scene-index.js";
 import type { SceneIndexEntry } from "../scene/scene-index.js";
-import { parseSceneBlock } from "../scene/scene-format.js";
-import { generateSceneNavigation, stripSceneNavigation } from "../scene/scene-navigation.js";
+import { parseSceneBlock, validateSceneBlock, isSoftDeletedScene } from "../scene/scene-format.js";
 import { normalizeSceneFilenames } from "./filename-normalizer.js";
 import type { MemoryPromptMode } from "../../config.js";
 import { buildSceneExtractionPrompt } from "../prompts/scene-extraction.js";
@@ -31,9 +33,15 @@ import { reportL2LatencyMetrics } from "../report/metric-tracking-l2-latency.js"
 import type { LLMRunner, Logger, TraceContext } from "../types.js";
 import { buildTraceParams } from "../types.js";
 import type { StorageAdapter } from "../storage/adapter.js";
+import { GenerationWorkspace } from "../storage/generation-workspace.js";
+import type { BeforeCommitCallback } from "../storage/generation-workspace.js";
 import { StoragePaths } from "../storage/types.js";
 import type { ResolvedMemoryPrompt } from "../memory-prompt/types.js";
 import { composeMemorySystemPrompt } from "../memory-prompt/composer.js";
+import { resolveSystemTemplate, validateSystemTemplate } from "../memory-prompt/template.js";
+import { SCENE_BLOCK_FILE_POLICY } from "../../adapters/standalone/memory-file-policy.js";
+import type { EffectiveSystemPromptInfo } from "../memory-generation-log/diagnostics.js";
+import type { ProfileHistoryRun } from "../content/generation-history.js";
 
 const TAG = "[memory-tdai] [extractor]";
 
@@ -45,6 +53,13 @@ export interface ExtractionResult {
   error?: string;
   /** True if LLM ran but produced no file changes (scene_index unchanged). */
   emptyExtraction?: boolean;
+  /** Scene files that failed strict format validation (filenames only). */
+  invalidSceneFiles?: string[];
+  /**
+   * Set only when a post-validation rollback could not be completed. Kept
+   * distinct from `error` so a failed rollback is never reported as success.
+   */
+  rollbackError?: string;
 }
 
 export interface SceneExtractorOptions {
@@ -56,6 +71,13 @@ export interface SceneExtractorOptions {
   promptMode?: MemoryPromptMode;
   /** Resolved custom strategy. Undefined preserves the current system prompt exactly. */
   memoryPrompt?: ResolvedMemoryPrompt;
+  /**
+   * Explicit L2 system-template override (trusted operator config, typically
+   * `persona.sceneSystemTemplate`). Undefined preserves the built-in system
+   * prompt byte-for-byte; a provided template fully replaces it and gets the
+   * mandatory L2 storage/provenance/file contract appended.
+   */
+  systemTemplate?: string;
   sceneBackupCount?: number;
   timeoutMs?: number;
   logger?: ExtractorLogger;
@@ -69,31 +91,20 @@ export interface SceneExtractorOptions {
   llmRunner?: LLMRunner;
   /** StorageAdapter for file operations (COS/local). Falls back to fs when absent. */
   storage?: StorageAdapter;
+  /**
+   * Optional program hook run inside the workspace just before the atomic
+   * publish. Used to write program-owned sidecars (e.g. content sources) that
+   * must ship with the generated content. A throw aborts the publish.
+   */
+  beforeCommit?: BeforeCommitCallback;
   /** langfuse 上报身份四元组（team/user/agent/session）。传下来会填充 trace 顶级字段。 */
   traceContext?: TraceContext;
-}
-
-/**
- * Parse LLM text output for a persona update request signal.
- *
- * Supports multiple formats for robustness:
- * - Block: [PERSONA_UPDATE_REQUEST]reason: xxx[/PERSONA_UPDATE_REQUEST]
- * - Inline: PERSONA_UPDATE_REQUEST: xxx
- */
-export function parsePersonaUpdateSignal(text: string): { reason: string } | null {
-  // Block format: [PERSONA_UPDATE_REQUEST]...[/PERSONA_UPDATE_REQUEST]
-  const blockMatch = text.match(
-    /\[PERSONA_UPDATE_REQUEST\]\s*(?:reason:\s*)?(.+?)\s*\[\/PERSONA_UPDATE_REQUEST\]/s,
-  );
-  if (blockMatch) return { reason: blockMatch[1]!.trim() };
-
-  // Inline format: PERSONA_UPDATE_REQUEST: reason text
-  const inlineMatch = text.match(
-    /PERSONA_UPDATE_REQUEST:\s*(.+?)(?:\n|$)/,
-  );
-  if (inlineMatch) return { reason: inlineMatch[1]!.trim() };
-
-  return null;
+  /**
+   * History-mode run. When present, the exact L1 inputs are registered before
+   * the prompt, the prior scene/persona versions are captured before the model,
+   * and the publish carries a program-only {@link GenerationHistoryPlan}.
+   */
+  history?: ProfileHistoryRun;
 }
 
 export class SceneExtractor {
@@ -103,23 +114,31 @@ export class SceneExtractor {
   private sceneBackupCount: number;
   private promptMode: MemoryPromptMode;
   private memoryPrompt: ResolvedMemoryPrompt | undefined;
+  private systemTemplate: string | undefined;
   private timeoutMs: number;
   private logger: ExtractorLogger | undefined;
   private instanceId: string | undefined;
   private storage: StorageAdapter | undefined;
+  private beforeCommit: BeforeCommitCallback | undefined;
   private traceContext: TraceContext | undefined;
+  private history: ProfileHistoryRun | undefined;
+  /** Diagnostic capture of the last prompt built for the LLM (see getter). */
+  private lastEffectiveSystemPrompt: EffectiveSystemPromptInfo | undefined;
 
   constructor(opts: SceneExtractorOptions) {
     this.dataDir = opts.dataDir;
     this.maxScenes = opts.maxScenes ?? 15;
     this.promptMode = opts.promptMode ?? "chat";
     this.memoryPrompt = opts.memoryPrompt;
+    this.systemTemplate = validateSystemTemplate(opts.systemTemplate, "persona.sceneSystemTemplate");
     this.sceneBackupCount = opts.sceneBackupCount ?? 10;
     this.timeoutMs = opts.timeoutMs ?? 300_000; // 5 min — LLM may do multiple tool calls
     this.logger = opts.logger;
     this.instanceId = opts.instanceId;
     this.storage = opts.storage;
+    this.beforeCommit = opts.beforeCommit;
     this.traceContext = opts.traceContext;
+    this.history = opts.history;
 
     // Use injected LLMRunner if available, otherwise fall back to CleanContextRunner
     this.runner = opts.llmRunner ?? new CleanContextRunner({
@@ -130,6 +149,15 @@ export class SceneExtractor {
     });
 
     this.logger?.debug?.(`${TAG} Created: dataDir=${opts.dataDir}, model=${opts.model ?? "(default)"}, promptMode=${this.promptMode}, maxScenes=${this.maxScenes}, timeout=${this.timeoutMs}ms`);
+  }
+
+  /**
+   * The system prompt handed to the runner in the last extract() call, plus
+   * its base/override provenance. Undefined until the prompt has been built.
+   * Diagnostic only — never fed back into generation.
+   */
+  getLastEffectiveSystemPrompt(): EffectiveSystemPromptInfo | undefined {
+    return this.lastEffectiveSystemPrompt;
   }
 
   /**
@@ -147,6 +175,27 @@ export class SceneExtractor {
       return { memoriesProcessed: 0, success: true };
     }
 
+    // ── Restricted generation workspace ─────────────────────────────────
+    // From here on every content read/write goes through a private working
+    // view. Published scene_blocks / persona / scene_index are only updated
+    // when the run completes validation + post-processing and commit()
+    // succeeds. Raw-FS mode seeds a physical staging copy; StorageAdapter
+    // mode uses a read-through/write-back overlay that never touches the
+    // published store until commit.
+    const baseStorage = this.storage;
+    const baseDataDir = this.dataDir;
+    const workspace = await GenerationWorkspace.begin({
+      storage: baseStorage,
+      dataDir: baseDataDir,
+      kind: "l2",
+      logger: this.logger,
+      beforeCommit: this.beforeCommit,
+      ...(this.history ? { historyContext: this.history.createPlan() } : {}),
+    });
+    this.storage = workspace.view;
+    this.dataDir = workspace.activeDataDir;
+    try {
+
     const sceneBlocksDir = this.storage ? StoragePaths.sceneBlocksDir : await (async () => { const path = await import("node:path"); return path.default.join(this.dataDir, "scene_blocks"); })();
     const metadataDir = this.storage ? StoragePaths.metadataDir : await (async () => { const path = await import("node:path"); return path.default.join(this.dataDir, ".metadata"); })();
 
@@ -162,7 +211,7 @@ export class SceneExtractor {
 
     // Phase 1: Backup
     const backupStartMs = Date.now();
-    const cpManager = new CheckpointManager(this.dataDir, this.logger, this.storage);
+    const cpManager = new CheckpointManager(baseDataDir, this.logger, baseStorage);
     const cp = await cpManager.read();
     // BackupManager is only meaningful for local-fs deployments. In service
     // mode (StorageAdapter / COS) snapshot/restore is the storage backend's
@@ -184,6 +233,39 @@ export class SceneExtractor {
     // Build scene summaries for the prompt (relative filenames only)
     const { summaries: sceneSummaries, filenames: existingSceneFiles } =
       this.buildSceneSummaries(index);
+
+    // History mode: register the EXACT versions of the material this run
+    // supplies (L1 inputs) and capture the prior version of every output we may
+    // rewrite — all BEFORE the model runs, so no baseline is taken "after the
+    // fact" from a current id. The exact bodies of the existing scenes are ALSO
+    // rendered into the prompt below so the model sees the same bytes that were
+    // registered.
+    const suppliedSceneBodies: Array<{ name: string; body: string }> = [];
+    if (this.history) {
+      const memoryIds = memories
+        .map((memory) => memory.id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0);
+      for (const memoryId of memoryIds) {
+        await this.history.registerL1Input(memoryId, `L1 ${memoryId}`);
+        // Supply the EXACT registered version body (never a recall/current copy
+        // keyed by the same id), so the prompt and the registration are one read.
+        const exact = this.history.bodyForL1Input(memoryId);
+        if (exact !== undefined) {
+          const memory = memories.find((candidate) => candidate.id === memoryId);
+          if (memory && memory.content !== exact) memory.content = exact;
+        }
+      }
+      this.history.setRunInputIds(memoryIds);
+      // Capture the prior version of every existing scene file BEFORE the model
+      // runs; their exact bodies are handed to the model in this prompt (below).
+      for (const name of existingSceneFiles) {
+        const key = `${StoragePaths.sceneBlocksDir}${name}`;
+        const prior = await this.history.capturePriorVersion(key, "l2");
+        if (prior) {
+          suppliedSceneBodies.push({ name, body: prior.body });
+        }
+      }
+    }
 
     // Build scene count warning (tiered system)
     let sceneCountWarning: string | undefined;
@@ -219,6 +301,11 @@ export class SceneExtractor {
       } catch { /* non-fatal */ }
     }
 
+    // Raw pre-run snapshot of every scene_blocks/*.md file (full raw content,
+    // not just the parsed body). Used to roll the directory back if the model
+    // produces output that fails strict format validation below.
+    const preRunSnapshot = await this.snapshotSceneBlocks(sceneBlocksDir);
+
     // Phase 3: Build prompt
     const promptStartMs = Date.now();
     const memoriesJson = JSON.stringify(
@@ -233,7 +320,7 @@ export class SceneExtractor {
 
     const currentTimestamp = formatTimestamp(new Date());
 
-    const { systemPrompt: baseSystemPrompt, userPrompt } = buildSceneExtractionPrompt({
+    const { systemPrompt: baseSystemPrompt, userPrompt: sceneUserPrompt } = buildSceneExtractionPrompt({
       memoriesJson,
       sceneSummaries: sceneSummaries || "(无已有场景)",
       currentTimestamp,
@@ -242,7 +329,17 @@ export class SceneExtractor {
       maxScenes: this.maxScenes,
       promptMode: this.promptMode,
     });
-    const systemPrompt = composeMemorySystemPrompt(baseSystemPrompt, this.memoryPrompt);
+    const userPrompt = `${sceneUserPrompt}${suppliedSceneBodies.length > 0
+      ? "\n\n【既有场景完整正文（程序在模型运行前登记的确切读取版本）】\n" +
+        suppliedSceneBodies.map((entry) => `### ${entry.name}\n\n\`\`\`markdown\n${entry.body}\n\`\`\``).join("\n\n")
+      : ""}`;
+    const selectedSystemPrompt = resolveSystemTemplate(baseSystemPrompt, this.systemTemplate, "l2");
+    const systemPrompt = composeMemorySystemPrompt(selectedSystemPrompt, this.memoryPrompt);
+    this.lastEffectiveSystemPrompt = {
+      systemPrompt,
+      baseSystemPrompt: selectedSystemPrompt,
+      baseSource: this.systemTemplate === undefined ? "builtin" : "operator_template",
+    };
     this.logger?.debug?.(`${TAG} extract() prompt built: ${userPrompt.length} chars (${Date.now() - promptStartMs}ms)`);
 
     // Phase 4: Run LLM agent (sandboxed to scene_blocks/)
@@ -259,10 +356,13 @@ export class SceneExtractor {
         taskId: `scene-extract-${Date.now()}`,
         timeoutMs: this.timeoutMs,
         // maxTokens omitted → core uses the resolved model's maxTokens from catalog
-        workspaceDir: sceneBlocksDir,
+        workspaceDir: this.storage ? workspace.stagingDir : sceneBlocksDir,
         // Service mode: LLM tools read/write via StorageAdapter (COS) instead of local FS
         storage: this.storage,
         storagePrefix: this.storage ? StoragePaths.sceneBlocksDir : undefined,
+        // L2: restrict the LLM's file tools to direct *.md scene blocks under
+        // this run's tool root — never checkpoints/index/JSONL/nested/hidden.
+        filePolicy: SCENE_BLOCK_FILE_POLICY,
         ...traceParams,
       }) ?? "";
       llmDurationMs = Date.now() - runnerStartMs;
@@ -293,6 +393,40 @@ export class SceneExtractor {
       }
 
       return { memoriesProcessed: 0, success: false, error: errMsg };
+    }
+
+    // Phase 4b: Strict output validation. The model writes files before we can
+    // inspect them, so validate every resulting .md scene file (exact [DELETED]
+    // markers excepted) BEFORE cleanup/index/navigation/checkpoint. Any
+    // malformed output rolls scene_blocks/ back to the pre-run snapshot and
+    // fails the extraction without advancing any progress state.
+    const formatCheck = await this.validateSceneBlocksAfterRun(sceneBlocksDir);
+    if (!formatCheck.valid) {
+      const baseError =
+        `Invalid scene block format in ${formatCheck.invalidFiles.length} file(s) ` +
+        `[${formatCheck.invalidFiles.join(", ")}]: ${formatCheck.errors.join("; ")}`;
+      this.logger?.error(`${TAG} extract() format validation failed: ${baseError}`);
+
+      const rollback = await this.restoreSceneBlocksSnapshot(sceneBlocksDir, preRunSnapshot);
+      if (rollback.ok) {
+        this.logger?.warn(`${TAG} extract() rolled back scene_blocks/ to pre-run snapshot`);
+        return {
+          memoriesProcessed: 0,
+          success: false,
+          error: baseError,
+          invalidSceneFiles: formatCheck.invalidFiles,
+        };
+      }
+
+      const rollbackError = rollback.error ?? "unknown rollback failure";
+      this.logger?.error(`${TAG} extract() rollback did NOT complete: ${rollbackError}`);
+      return {
+        memoriesProcessed: 0,
+        success: false,
+        error: `${baseError} | rollback failed: ${rollbackError}`,
+        rollbackError,
+        invalidSceneFiles: formatCheck.invalidFiles,
+      };
     }
 
     // Phase 5: Subsequent processing — safe cleanup of soft-deleted files
@@ -326,7 +460,9 @@ export class SceneExtractor {
           raw = await fs.default.readFile(path.default.join(this.dataDir, "scene_blocks", file), "utf-8");
         }
         if (!raw || raw.trim().length === 0 || raw.trim() === "[DELETED]") {
-          // Empty file or [DELETED] marker — soft-delete
+          // Empty file or [DELETED] marker — soft-delete. In history mode this is
+          // the model's EXPLICIT retire declaration for the locator.
+          if (this.history) this.history.noteRetired(`${StoragePaths.sceneBlocksDir}${file}`);
           if (this.storage) {
             await this.storage.unlink(`${StoragePaths.sceneBlocksDir}${file}`);
           } else {
@@ -340,6 +476,7 @@ export class SceneExtractor {
           // Check if file has only META header but no actual content
           const block = parseSceneBlock(raw, file);
           if (!block.content || block.content.trim().length === 0) {
+            if (this.history) this.history.noteRetired(`${StoragePaths.sceneBlocksDir}${file}`);
             if (this.storage) {
               await this.storage.unlink(`${StoragePaths.sceneBlocksDir}${file}`);
             } else {
@@ -365,7 +502,7 @@ export class SceneExtractor {
     // (health-checker), shell tools, and URL-encoded path consumers.
     //
     // Renaming here — *before* syncSceneIndex — means scene_index.json and
-    // every downstream reader (PersonaGenerator, recall, profile-sync) only
+    // every downstream reader (recall, profile-sync, 主 Agent 读取) only
     // ever sees canonical filenames. Idempotent and safe to run repeatedly.
     const normStartMs = Date.now();
     try {
@@ -390,23 +527,14 @@ export class SceneExtractor {
     await syncSceneIndex(this.dataDir, this.storage);
     this.logger?.debug?.(`${TAG} extract() scene index synced: ${Date.now() - syncStartMs}ms`);
 
-    // Phase 7: Update persona.md navigation (GAP-4 fix)
-    const navStartMs = Date.now();
+    // Publish staged content before any control-plane write, so a failed
+    // publish can never advance checkpoint state.
     try {
-      await this.updateSceneNavigation();
-      this.logger?.debug?.(`${TAG} extract() persona.md navigation updated: ${Date.now() - navStartMs}ms`);
-    } catch (navErr) {
-      // Non-fatal — log and continue
-      this.logger?.warn(`${TAG} extract() failed to update persona navigation: ${navErr instanceof Error ? navErr.message : String(navErr)}`);
-    }
-
-    // Phase 8: Parse LLM output for out-of-band persona update signal
-    if (llmOutput) {
-      const signal = parsePersonaUpdateSignal(llmOutput);
-      if (signal) {
-        await cpManager.setPersonaUpdateRequest(signal.reason);
-        this.logger?.debug?.(`${TAG} extract() persona update requested by LLM: ${signal.reason}`);
-      }
+      await workspace.commit({ kind: "l2", memoriesProcessed: memories.length, input_ids: memories.flatMap(memory => memory.id ? [memory.id] : []), scope: this.traceContext ? { team_id: this.traceContext.teamId, agent_id: this.traceContext.agentId } : {} });
+    } catch (publishErr) {
+      const msg = publishErr instanceof Error ? publishErr.message : String(publishErr);
+      this.logger?.error(`${TAG} extract() publish failed: ${msg}`);
+      return { memoriesProcessed: 0, success: false, error: `publish failed: ${msg}`, rollbackError: msg };
     }
 
     const totalMs = Date.now() - extractStartMs;
@@ -514,6 +642,17 @@ export class SceneExtractor {
     }
 
     return { memoriesProcessed: memories.length, success: true, emptyExtraction };
+    } finally {
+      this.storage = baseStorage;
+      this.dataDir = baseDataDir;
+      if (!workspace.isCommitted) {
+        try {
+          await workspace.discard();
+        } catch {
+          // discard is best-effort — a leaked staging dir must never affect reads
+        }
+      }
+    }
   }
 
   /**
@@ -545,57 +684,127 @@ export class SceneExtractor {
     return { summaries: lines.join("\n"), filenames };
   }
 
-  /**
-   * Update the scene navigation section at the end of persona.md.
-   *
-   * Reads the current scene index, generates the navigation block, then
-   * strips any existing navigation from persona.md and appends the new one.
-   *
-   * IMPORTANT: If the persona body is empty (PersonaGenerator hasn't run yet),
-   * we skip writing to avoid creating a persona.md that only contains the
-   * scene navigation. PersonaGenerator.generate() will write the full
-   * persona + navigation when it runs.
-   */
-  private async updateSceneNavigation(): Promise<void> {
-    const index = await readSceneIndex(this.dataDir, this.storage);
-    const nav = generateSceneNavigation(index);
-
-    let existing = "";
-    try {
-      if (this.storage) {
-        existing = (await this.storage.readFile(StoragePaths.persona)) ?? "";
-      } else {
-        const fs = await import("node:fs/promises");
-        const path = await import("node:path");
-        existing = await fs.default.readFile(path.default.join(this.dataDir, "persona.md"), "utf-8");
-      }
-    } catch {
-      // No persona file yet — PersonaGenerator will create it with navigation.
-      // Don't write a navigation-only file.
-      this.logger?.debug?.(`${TAG} updateSceneNavigation() skipped: no persona file yet, waiting for PersonaGenerator`);
-      return;
-    }
-
-    if (!existing.trim() && !nav) return;
-
-    const stripped = stripSceneNavigation(existing).trimEnd();
-
-    // If the persona body is empty (only navigation existed), don't overwrite
-    // with a navigation-only file. Let PersonaGenerator handle full generation.
-    if (!stripped) {
-      this.logger?.debug?.(`${TAG} updateSceneNavigation() skipped: persona body is empty, waiting for PersonaGenerator`);
-      return;
-    }
-
-    const updated = nav ? `${stripped}\n\n${nav}\n` : `${stripped}\n`;
-
+  /** List the .md scene block filenames currently present (sorted). */
+  private async listSceneBlockNames(sceneBlocksDir: string): Promise<string[]> {
     if (this.storage) {
-      await this.storage.writeFile(StoragePaths.persona, updated);
-    } else {
-      const fs = await import("node:fs/promises");
-      const path = await import("node:path");
-      await fs.default.writeFile(path.default.join(this.dataDir, "persona.md"), updated, "utf-8");
+      const names = await this.storage.readdirNames(StoragePaths.sceneBlocksDir, ".md");
+      return names.filter((name) => name.endsWith(".md")).sort();
     }
+    const fs = await import("node:fs/promises");
+    try {
+      const names = (await fs.default.readdir(sceneBlocksDir)).filter((f) => f.endsWith(".md"));
+      return names.sort();
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
+    }
+  }
+
+  /** Read one scene block's raw content (null when absent). */
+  private async readSceneBlockRaw(sceneBlocksDir: string, name: string): Promise<string | null> {
+    if (this.storage) {
+      return await this.storage.readFile(`${StoragePaths.sceneBlocksDir}${name}`);
+    }
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    return await fs.default.readFile(path.default.join(sceneBlocksDir, name), "utf-8");
+  }
+
+  /** Snapshot raw content of every .md scene block before the model runs. */
+  private async snapshotSceneBlocks(sceneBlocksDir: string): Promise<Map<string, string>> {
+    const snapshot = new Map<string, string>();
+    for (const name of await this.listSceneBlockNames(sceneBlocksDir)) {
+      const raw = await this.readSceneBlockRaw(sceneBlocksDir, name);
+      if (raw !== null) snapshot.set(name, raw);
+    }
+    return snapshot;
+  }
+
+  /**
+   * Strictly validate every .md scene file produced by the model run.
+   * Exact `[DELETED]` markers are skipped (orchestration-level deletion),
+   * everything else must pass `validateSceneBlock`.
+   */
+  private async validateSceneBlocksAfterRun(
+    sceneBlocksDir: string,
+  ): Promise<{ valid: boolean; invalidFiles: string[]; errors: string[] }> {
+    const invalidFiles: string[] = [];
+    const errors: string[] = [];
+    for (const name of await this.listSceneBlockNames(sceneBlocksDir)) {
+      let raw: string | null;
+      try {
+        raw = await this.readSceneBlockRaw(sceneBlocksDir, name);
+      } catch (err) {
+        invalidFiles.push(name);
+        errors.push(`${name}: unreadable (${err instanceof Error ? err.message : String(err)})`);
+        continue;
+      }
+      if (raw === null) continue;
+      if (isSoftDeletedScene(raw)) continue;
+      const result = validateSceneBlock(raw, name);
+      if (!result.valid) {
+        invalidFiles.push(name);
+        errors.push(`${name}: ${result.error ?? "invalid scene format"}`);
+      }
+    }
+    return { valid: invalidFiles.length === 0, invalidFiles, errors };
+  }
+
+  /**
+   * Restore scene_blocks/ to the pre-run snapshot:
+   *   - delete .md files the model newly added,
+   *   - rewrite every pre-existing .md file with its original raw content.
+   * Only .md scene files are touched. Returns `ok:false` with a distinct error
+   * when any file could not be restored, so callers never claim a successful
+   * rollback.
+   */
+  private async restoreSceneBlocksSnapshot(
+    sceneBlocksDir: string,
+    snapshot: Map<string, string>,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const errors: string[] = [];
+
+    let present: string[];
+    try {
+      present = await this.listSceneBlockNames(sceneBlocksDir);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: `could not list scene_blocks for rollback: ${msg}` };
+    }
+
+    for (const name of present) {
+      if (snapshot.has(name)) continue;
+      try {
+        if (this.storage) {
+          await this.storage.unlink(`${StoragePaths.sceneBlocksDir}${name}`);
+        } else {
+          const fs = await import("node:fs/promises");
+          const path = await import("node:path");
+          await fs.default.unlink(path.default.join(sceneBlocksDir, name));
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push(`remove added ${name}: ${msg}`);
+      }
+    }
+
+    for (const [name, raw] of snapshot) {
+      try {
+        if (this.storage) {
+          await this.storage.writeFile(`${StoragePaths.sceneBlocksDir}${name}`, raw);
+        } else {
+          const fs = await import("node:fs/promises");
+          const path = await import("node:path");
+          await fs.default.mkdir(sceneBlocksDir, { recursive: true });
+          await fs.default.writeFile(path.default.join(sceneBlocksDir, name), raw, "utf-8");
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push(`restore ${name}: ${msg}`);
+      }
+    }
+
+    return errors.length === 0 ? { ok: true } : { ok: false, error: errors.join("; ") };
   }
 }
 

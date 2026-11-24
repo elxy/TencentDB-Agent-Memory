@@ -1,5 +1,6 @@
 /**
- * MemoryPipelineManager: manages the L0→L1→L2→L3 memory extraction pipeline.
+ * MemoryPipelineManager: manages the L0→L1→L2 memory extraction pipeline
+ * (Core 自动生成 L3 已于 2026-10-12 撤掉；L3 只由主 Agent 写入).
  *
  * ## Layered architecture
  *
@@ -23,7 +24,7 @@
  *   the timer is cancelled rather than triggering L2 — it will be re-armed
  *   by the next L1 event.
  *
- * - **L3 (persona generation)**: Global mutex (concurrency=1) + pending flag
+ * - **L3**: 2026-10-12 起不再由本调度器驱动（Core 自动生成已撤掉）。
  *   dedup. Triggered after L2 completes.
  *
  * ## Timer semantics
@@ -180,8 +181,6 @@ export interface L2RunnerResult {
 /** L2 extraction runner — processes a single session's records. */
 export type L2Runner = (sessionKey: string, cursor?: string) => Promise<L2RunnerResult | void>;
 
-/** L3 runner — generates persona from all sessions' scene data. */
-export type L3Runner = () => Promise<void>;
 
 /** Callback to persist session states to checkpoint. */
 export type PipelineStatePersister = (states: Record<string, PipelineSessionState>) => Promise<void>;
@@ -223,11 +222,7 @@ export class MemoryPipelineManager {
   // Queues (named for diagnostics)
   private readonly l1Queue = new SerialQueue("L1");
   private readonly l2Queue = new SerialQueue("L2");
-  private readonly l3Queue = new SerialQueue("L3");
 
-  // L3 dedup flag
-  private l3Pending = false;
-  private l3Running = false;
 
   // Per-session state
   private readonly sessionStates = new Map<string, PipelineSessionState>();
@@ -242,7 +237,6 @@ export class MemoryPipelineManager {
   // Callbacks
   private l1Runner: L1Runner | null = null;
   private l2Runner: L2Runner | null = null;
-  private l3Runner: L3Runner | null = null;
   private persister: PipelineStatePersister | null = null;
   private logger: Logger | undefined;
 
@@ -289,7 +283,6 @@ export class MemoryPipelineManager {
       const debugFn = (msg: string) => this.logger?.debug?.(`${TAG} ${msg}`);
       this.l1Queue.setDebugLogger(debugFn);
       this.l2Queue.setDebugLogger(debugFn);
-      this.l3Queue.setDebugLogger(debugFn);
     }
   }
 
@@ -305,9 +298,6 @@ export class MemoryPipelineManager {
     this.l2Runner = runner;
   }
 
-  setL3Runner(runner: L3Runner): void {
-    this.l3Runner = runner;
-  }
 
   setPersister(persister: PipelineStatePersister): void {
     this.persister = persister;
@@ -524,7 +514,7 @@ export class MemoryPipelineManager {
   /**
    * Graceful shutdown with timeout protection:
    * 1. Mark destroyed, stop accepting new work
-   * 2. Attempt to flush pending L1/L2/L3 work within DESTROY_TIMEOUT_MS
+   * 2. Attempt to flush pending L1/L2 work within DESTROY_TIMEOUT_MS
    * 3. If flush times out or fails, persist current state for recovery on next startup
    * 4. Pending work is never lost — it will be recovered via checkpoint on next start()
    */
@@ -569,7 +559,7 @@ export class MemoryPipelineManager {
   }
 
   /**
-   * Internal: attempt to flush all pending pipeline work (L1 → L2 → L3).
+   * Internal: attempt to flush all pending pipeline work (L1 → L2).
    * Extracted from destroy() so it can be wrapped with a timeout.
    */
   private async _doFlush(): Promise<void> {
@@ -598,10 +588,9 @@ export class MemoryPipelineManager {
     }
 
     // Step 4: Wait for all remaining queues to drain
-    this.logger?.debug?.(`${TAG} Waiting for queues to drain (l2=${this.l2Queue.size}, l3=${this.l3Queue.size})`);
+    this.logger?.debug?.(`${TAG} Waiting for queues to drain (l2=${this.l2Queue.size})`);
     await Promise.all([
       this.l2Queue.onIdle(),
-      this.l3Queue.onIdle(),
     ]);
   }
 
@@ -977,66 +966,7 @@ export class MemoryPipelineManager {
     // Arm the maxInterval timer for the next cycle
     this.armL2MaxInterval(sessionKey);
 
-    // Trigger L3
-    this.triggerL3();
-  }
-
-  // ============================
-  // Internal: L3 queue (global, dedup)
-  // ============================
-
-  private triggerL3(): void {
-    if (this.destroyed) return;
-
-    if (this.l3Running) {
-      // L3 is in progress — mark pending so it runs again after current finishes
-      this.l3Pending = true;
-      this.logger?.debug?.(`${TAG} L3 already running, marking pending`);
-      return;
-    }
-
-    this.logger?.debug?.(`${TAG} Triggering L3`);
-    this.enqueueL3();
-  }
-
-  private enqueueL3(): void {
-    this.l3Running = true;
-    this.l3Pending = false;
-
-    this.logger?.debug?.(`${TAG} Enqueuing L3 (queue=${this.l3Queue.name})`);
-
-    this.l3Queue.add(async () => {
-      await this.runL3();
-    }).catch((err) => {
-      this.logger?.error(
-        `${TAG} L3 task failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`,
-      );
-    }).finally(() => {
-      this.l3Running = false;
-
-      // If new L2 completions happened while L3 was running, run again
-      if (this.l3Pending && !this.destroyed) {
-        this.logger?.debug?.(`${TAG} L3 has pending work, re-running`);
-        this.enqueueL3();
-      }
-    });
-  }
-
-  private async runL3(): Promise<void> {
-    if (!this.l3Runner) {
-      this.logger?.warn(`${TAG} No L3 runner set, skipping`);
-      return;
-    }
-
-    this.logger?.debug?.(`${TAG} L3 running`);
-    try {
-      await this.l3Runner();
-      this.logger?.debug?.(`${TAG} L3 complete`);
-    } catch (err) {
-      this.logger?.error(
-        `${TAG} L3 runner failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`,
-      );
-    }
+    // 2026-10-12：不再触发 L3 自动生成（L3 只由主 Agent 写入）。
   }
 
   // ============================
@@ -1199,20 +1129,17 @@ export class MemoryPipelineManager {
 
   /** Queue sizes and running state for monitoring. */
   getQueueSizes(): {
-    l1: number; l2: number; l3: number;
-    l1Pending: boolean; l2Pending: boolean; l3Pending: boolean;
-    l1Idle: boolean; l2Idle: boolean; l3Idle: boolean;
+    l1: number; l2: number;
+    l1Pending: boolean; l2Pending: boolean;
+    l1Idle: boolean; l2Idle: boolean;
   } {
     return {
       l1: this.l1Queue.size,
       l2: this.l2Queue.size,
-      l3: this.l3Queue.size,
       l1Pending: this.l1Queue.pending,
       l2Pending: this.l2Queue.pending,
-      l3Pending: this.l3Queue.pending,
       l1Idle: this.l1Queue.idle,
       l2Idle: this.l2Queue.idle,
-      l3Idle: this.l3Queue.idle,
     };
   }
 }

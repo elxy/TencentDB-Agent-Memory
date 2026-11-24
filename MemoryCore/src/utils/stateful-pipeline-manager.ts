@@ -3,7 +3,7 @@
  *
  * 需求 #8: Core 完全无状态化
  *
- * 与原 MemoryPipelineManager 保持相同的外部接口（L1/L2/L3 Runner、
+ * 与原 MemoryPipelineManager 保持相同的外部接口（L1/L2 Runner、
  * notifyConversation、flushSession、destroy），但内部状态全部通过
  * IStateBackend 管理，不在进程内维护任何 Map/Timer/Queue。
  *
@@ -12,7 +12,7 @@
  *
  * 关键设计差异：
  * - notifyConversation → captureAtomic（原子递增 + 阈值判断 + 入队/设 Timer）
- * - L1/L2/L3 执行由外部 Worker 从 TaskQueue 消费（本模块只负责入队）
+ * - L1/L2 执行由外部 Worker 从 TaskQueue 消费（本模块只负责入队）
  * - Timer 过期检测由外部 Timer Scanner 负责（或 LocalStateBackend 内置 setTimeout）
  * - flushSession → enqueueTask(flush) 入队而非进程内直接执行
  */
@@ -70,7 +70,6 @@ export interface L1RunnerResult {
 export type L1Runner = (params: { sessionKey: string; msg: CapturedMessage[]; bg_msg: CapturedMessage[] }) => Promise<L1RunnerResult | void>;
 export interface L2RunnerResult { latestCursor?: string; }
 export type L2Runner = (sessionKey: string, cursor?: string) => Promise<L2RunnerResult | void>;
-export type L3Runner = () => Promise<void>;
 export type PipelineStatePersister = (states: Record<string, CheckpointPipelineSessionState>) => Promise<void>;
 
 const TAG = "[memory-tdai] [pipeline-v2]";
@@ -97,7 +96,6 @@ export class StatefulPipelineManager {
   // Callbacks (same interface as MemoryPipelineManager)
   private l1Runner: L1Runner | null = null;
   private l2Runner: L2Runner | null = null;
-  private l3Runner: L3Runner | null = null;
   private persister: PipelineStatePersister | null = null;
 
   private destroyed = false;
@@ -136,7 +134,6 @@ export class StatefulPipelineManager {
 
   setL1Runner(runner: L1Runner): void { this.l1Runner = runner; }
   setL2Runner(runner: L2Runner): void { this.l2Runner = runner; }
-  setL3Runner(runner: L3Runner): void { this.l3Runner = runner; }
   setPersister(persister: PipelineStatePersister): void { this.persister = persister; }
 
   /**
@@ -440,7 +437,6 @@ export class StatefulPipelineManager {
 
   getL1Runner(): L1Runner | null { return this.l1Runner; }
   getL2Runner(): L2Runner | null { return this.l2Runner; }
-  getL3Runner(): L3Runner | null { return this.l3Runner; }
 
   get isDestroyed(): boolean { return this.destroyed; }
 

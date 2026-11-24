@@ -46,7 +46,6 @@ import {
   createL1Runner,
   createPersister,
   createL2Runner,
-  createL3Runner,
 } from "../utils/pipeline-factory.js";
 import { MemoryPipelineManager } from "../utils/pipeline-manager.js";
 import { CheckpointManager } from "../utils/checkpoint.js";
@@ -758,20 +757,8 @@ export class TdaiCore {
       return l2Runner(sessionKey, cursor);
     });
 
-    // L3 runner
-    this.scheduler.setL3Runner(async () => {
-      const l3Runner = createL3Runner({
-        pluginDataDir: this.dataDir,
-        cfg: this.cfg,
-        openclawConfig,
-        vectorStore: this.vectorStore,
-        logger: this.logger,
-        instanceId: this.instanceId,
-        llmRunner: l2l3LlmRunner,
-        storage: this.storage,
-      });
-      await l3Runner();
-    });
+    // 2026-10-12：Core 自动生成 L3（persona）已撤掉，不再接 L3 runner；
+    // L3 三份文档只由主 Agent 经 content/write 写入。
 
     this.logger.debug?.(`${TAG} Pipeline runners wired`);
   }
@@ -1149,48 +1136,6 @@ export class TdaiCore {
     // L2 runner returns undefined when no new L1 records, or { skipped: true } on empty extraction
     const skipped = (runnerResult === undefined && creditUsed === 0) || (runnerResult?.skipped === true);
     return { creditUsed, skipped };
-  }
-
-  /**
-   * Run L3 persona generation using an externally provided Store.
-   */
-  async runL3WithStore(store: IMemoryStore, storage?: StorageAdapter): Promise<{ creditUsed: number }> {
-    const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
-    const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
-      ? (this.hostAdapter as { getOpenClawConfig?(): unknown }).getOpenClawConfig?.()
-      : undefined;
-
-    let runnerFactory = this.runnerFactory;
-    if (this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
-      const runtimeLlm = this.resolveRuntimeLlm();
-      runnerFactory = new StandaloneLLMRunnerFactory({
-        config: runtimeLlm,
-        logger: this.logger,
-      });
-      this.logger.debug?.(
-        `${TAG} [L3] Using standalone LLM override: provider=${this.cfg.llm.provider ?? "openai"}, ` +
-        `model=${runtimeLlm.model}, baseUrl=${runtimeLlm.baseUrl}`,
-      );
-    }
-    // 用 MetricTrackingRunnerFactory 装饰器包装（非侵入式 credit 上报）
-    const trackingFactory = new MetricTrackingRunnerFactory(runnerFactory, () => this.instanceId);
-    const llmRunner = useStandaloneRunner
-      ? trackingFactory.createRunner({ enableTools: true })
-      : undefined;
-
-    const runner = createL3Runner({
-      pluginDataDir: this.dataDir,
-      cfg: this.cfg,
-      openclawConfig,
-      vectorStore: store,
-      logger: this.logger,
-      instanceId: this.instanceId,
-      llmRunner,
-      storage: storage ?? this.getStorage(),
-    });
-    await runner();
-    const creditUsed: number = (llmRunner as any)?.accumulatedCredit ?? 0;
-    return { creditUsed };
   }
 
   private ensureSchedulerStarted(): Promise<void> {

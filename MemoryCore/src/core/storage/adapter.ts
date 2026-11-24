@@ -14,6 +14,18 @@
 import type { IStorageBackend, StorageObject, ListEntry, ListObjectsOptions, ListResult, PutObjectOptions } from "./types.js";
 import type { ProfileIsolation } from "../profile/profile-scope.js";
 import { isProfileIsolationRebindable } from "./composite-backend.js";
+import path from "node:path";
+import {
+  readPublishedObject,
+  listPublishedObjects,
+  publishContentMutation,
+  openPublishedSnapshot,
+  isBundleContentKey,
+  isBundleContentPrefix,
+  getLocalPublishRootOf,
+  type PublishedSnapshot,
+} from "./local-published-storage.js";
+import { LocalContentHistory } from "./local-content-history.js";
 
 class ScopedStorageBackend implements IStorageBackend {
   readonly type: IStorageBackend["type"];
@@ -40,24 +52,96 @@ class ScopedStorageBackend implements IStorageBackend {
     return key.startsWith(this.prefix) ? key.slice(this.prefix.length) : key;
   }
 
+  /**
+   * The local publish root for this scoped view: the base view's root with the
+   * scope prefix appended. This is how a scoped reader/writer reaches the
+   * bundle pointer that lives under `profiles/<scope>/` without the base
+   * backend having to know the scope.
+   */
+  private scopedPublishRoot(): string | null {
+    const baseRoot = getLocalPublishRootOf(this.base);
+    if (!baseRoot) return null;
+    const segments = this.prefix.split("/").filter((segment) => segment.length > 0);
+    return segments.length > 0 ? path.resolve(baseRoot, ...segments) : baseRoot;
+  }
+
+  /**
+   * Forwarded local publish capability. Keeps the identity directory root:
+   * a scoped view publishes under `baseRoot/<prefix>`.
+   */
+  getLocalPublishRoot(): string {
+    const root = this.scopedPublishRoot();
+    if (!root) {
+      throw new Error(
+        `ScopedStorageBackend cannot expose a local publish root: ` +
+          `base backend (type=${this.base.type}) has no local publish capability`,
+      );
+    }
+    return root;
+  }
+
+  /** Pin one revision for this scoped view for the whole read request. */
+  async openPublishedSnapshot(): Promise<PublishedSnapshot | null> {
+    const root = this.scopedPublishRoot();
+    if (!root) return null;
+    return openPublishedSnapshot(root);
+  }
+
+  /** Formal content history for this scoped view (publishes under the scope). */
+  getContentHistory(clock?: () => Date): LocalContentHistory {
+    const root = this.scopedPublishRoot();
+    if (!root) {
+      throw new Error(
+        `ScopedStorageBackend cannot expose a content history: ` +
+          `base backend (type=${this.base.type}) has no local publish capability`,
+      );
+    }
+    return new LocalContentHistory(root, clock);
+  }
+
   async putObject(key: string, content: string | Buffer, opts?: PutObjectOptions): Promise<void> {
+    if (isBundleContentKey(key)) {
+      const root = this.scopedPublishRoot();
+      if (root) {
+        const buf = typeof content === "string" ? Buffer.from(content, "utf-8") : Buffer.from(content);
+        await publishContentMutation(root, { writes: [{ key, content: buf }] });
+        return;
+      }
+    }
     return this.base.putObject(this.key(key), content, opts);
   }
 
   async appendObject(key: string, content: string | Buffer): Promise<void> {
+    if (isBundleContentKey(key)) {
+      throw new Error(
+        `ScopedStorageBackend appendObject unsupported for bundle content key ${JSON.stringify(key)}`,
+      );
+    }
     return this.base.appendObject(this.key(key), content);
   }
 
   async getObject(key: string): Promise<StorageObject | null> {
+    if (isBundleContentKey(key)) {
+      const root = this.scopedPublishRoot();
+      if (root) return readPublishedObject(root, key);
+    }
     const obj = await this.base.getObject(this.key(key));
     return obj ? { ...obj, key: this.unkey(obj.key) } : null;
   }
 
   async exists(key: string): Promise<boolean> {
+    if (isBundleContentKey(key)) {
+      const root = this.scopedPublishRoot();
+      if (root) return (await readPublishedObject(root, key)) !== null;
+    }
     return this.base.exists(this.key(key));
   }
 
   async listObjects(prefix: string, opts?: ListObjectsOptions): Promise<ListResult> {
+    if (isBundleContentPrefix(prefix)) {
+      const root = this.scopedPublishRoot();
+      if (root) return listPublishedObjects(root, prefix, opts);
+    }
     const result = await this.base.listObjects(this.key(prefix), opts ? {
       ...opts,
       marker: opts.marker ? this.key(opts.marker) : undefined,
@@ -70,10 +154,27 @@ class ScopedStorageBackend implements IStorageBackend {
   }
 
   async deleteObject(key: string): Promise<void> {
+    if (isBundleContentKey(key)) {
+      const root = this.scopedPublishRoot();
+      if (root) {
+        await publishContentMutation(root, { deletes: [key] });
+        return;
+      }
+    }
     return this.base.deleteObject(this.key(key));
   }
 
   async deleteByPrefix(prefix: string): Promise<number> {
+    if (isBundleContentPrefix(prefix)) {
+      const root = this.scopedPublishRoot();
+      if (root) {
+        const listed = await listPublishedObjects(root, prefix, { recursive: true, maxKeys: 100_000 });
+        const keys = listed.entries.filter((entry) => !entry.isDirectory).map((entry) => entry.key);
+        if (keys.length === 0) return 0;
+        await publishContentMutation(root, { deletes: keys });
+        return keys.length;
+      }
+    }
     return this.base.deleteByPrefix(this.key(prefix));
   }
 }
@@ -334,5 +435,17 @@ export class StorageAdapter {
 
   getBackend(): IStorageBackend {
     return this.backend;
+  }
+
+  /**
+   * Formal L2/L3 content history for this view, when the underlying backend
+   * supports it (local filesystem). Returns null for backends that cannot host
+   * an immutable content-bundle chain.
+   */
+  getContentHistory(clock?: () => Date): LocalContentHistory | null {
+    const fn = (this.backend as unknown as { getContentHistory?: (c?: () => Date) => LocalContentHistory })
+      .getContentHistory;
+    if (typeof fn !== "function") return null;
+    return fn.call(this.backend, clock) ?? null;
   }
 }

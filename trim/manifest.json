@@ -1,0 +1,344 @@
+{
+ "upstream": "https://github.com/TencentCloud/TencentDB-Agent-Memory",
+ "base_ref": "v2.0.2",
+ "base_commit": "99a1a2c251741658917e3fa700bf8e337ad15a5f",
+ "base_version": "1.0.2-beta.1",
+ "subtree": "MemoryCore/",
+ "counts": {
+  "modified": 31,
+  "added": 18,
+  "removed": 99
+ },
+ "modified": [
+  {
+   "path": "src/adapters/standalone/llm-runner.ts",
+   "upstream_sha": "f84b48acea0c8a7bea7e6d3367dd04d9a8f744f6",
+   "trimmed_sha": "bd5f22dc6b2c513a4860ba2a63864966f356b3f5"
+  },
+  {
+   "path": "src/adapters/standalone/storage-tools.ts",
+   "upstream_sha": "c7d25c0ae1590e40448203675b0929db2bef4e46",
+   "trimmed_sha": "74060b09be3a37f4129d78fd543f0f161d585c93"
+  },
+  {
+   "path": "src/config.ts",
+   "upstream_sha": "c3f862802d6ea7dc0788c55a80c291a0c7ae1521",
+   "trimmed_sha": "35e62da84f19390a02368b3d14e9328d2f469b77"
+  },
+  {
+   "path": "src/core/memory-generation-log/types.ts",
+   "upstream_sha": "7bf87032f40a60f84eb863604d0655f8070e2997",
+   "trimmed_sha": "4a7049cecd33aa5e3b33b26c2c454cf7b6983d2e"
+  },
+  {
+   "path": "src/core/profile/profile-sync.ts",
+   "upstream_sha": "d40b393adca8404106fb38a67d15b20975e4f6f2",
+   "trimmed_sha": "a75db3fb717cfde4aa84e6e95048e87b95af24e1"
+  },
+  {
+   "path": "src/core/prompts/l1-dedup.ts",
+   "upstream_sha": "41e73c170a9c5ed05e974ce439ec832b6bd65e80",
+   "trimmed_sha": "cb78af041c0a406aa468894f3eef8358690f7d38"
+  },
+  {
+   "path": "src/core/prompts/l1-extraction.ts",
+   "upstream_sha": "2489a2c4e3de0506ae9e8e2dc6af8960c994c413",
+   "trimmed_sha": "93ca5167dd8f4cc167932ce3388073a1bc689942"
+  },
+  {
+   "path": "src/core/prompts/scene-extraction.ts",
+   "upstream_sha": "852fc45aa0bcb23f29e5237d6fb94cd3cece1285",
+   "trimmed_sha": "ff5bfdd8e1165e0bc10eedfdc9ff9475e2e2531a"
+  },
+  {
+   "path": "src/core/record/l1-dedup.ts",
+   "upstream_sha": "d35c8f303649465143fba36328a99bc0c3954109",
+   "trimmed_sha": "c47e88484e6bbbd68951096a00538ef75456d79f"
+  },
+  {
+   "path": "src/core/record/l1-extractor.ts",
+   "upstream_sha": "ad0a500bd5ce08cad69a8368ff0f889395de1287",
+   "trimmed_sha": "f14dae7af91f3301736fac61d2b3ee9be337cc7c"
+  },
+  {
+   "path": "src/core/record/l1-reader.ts",
+   "upstream_sha": "223d73d045b94c86b782819c3b1226abde86f41b",
+   "trimmed_sha": "c8cd617c12bdae9d02a8ce0a15bce7a47ea2e43f"
+  },
+  {
+   "path": "src/core/record/l1-writer.ts",
+   "upstream_sha": "48cad66b6be9c0e718bacc29ca9d2ad3684f0ba8",
+   "trimmed_sha": "82651d2367b3c4038a73548319b215acbb9e552d"
+  },
+  {
+   "path": "src/core/scene/filename-normalizer.ts",
+   "upstream_sha": "b94c6358aa01ea1b810fc3bea9fbcd2276917af2",
+   "trimmed_sha": "115820ec9b3c4f536a8acba96a0268934a952939"
+  },
+  {
+   "path": "src/core/scene/scene-extractor.ts",
+   "upstream_sha": "d9d434a6fcd1f6ce1c39a3ad617ba4c37a47c4d3",
+   "trimmed_sha": "df3a80b066d0f6eb47bf4be28bf9546c4db6c61b"
+  },
+  {
+   "path": "src/core/scene/scene-format.ts",
+   "upstream_sha": "cb12628de4a30e225f7272c099d50acc2291f1ae",
+   "trimmed_sha": "8f655cd0696918a6c7b6e574915a083a0744363a"
+  },
+  {
+   "path": "src/core/seed/seed-runtime.ts",
+   "upstream_sha": "cc21a998a109dd9e1107fc7f1f57e0f24801c90c",
+   "trimmed_sha": "7da14efee85474c4d1117c46e116613f36bc00e1"
+  },
+  {
+   "path": "src/core/storage/adapter.ts",
+   "upstream_sha": "5f6a477136d6a38b833bf740b44e8b9a104c69b6",
+   "trimmed_sha": "a2424fadbd164e8a30bfc75e42dc3bd2064b85db"
+  },
+  {
+   "path": "src/core/storage/composite-backend.ts",
+   "upstream_sha": "3e3efa3d58e800310cd446fd2c2e7a7863b80236",
+   "trimmed_sha": "7f3d6bec73a765bd2e1b82887a37445ef4f943ea"
+  },
+  {
+   "path": "src/core/storage/local-backend.ts",
+   "upstream_sha": "024043f05bfbb12bca5fe7a64aab87f94327df4a",
+   "trimmed_sha": "76070cce50730b4a50afdb2320f3fb67e13e50f6"
+  },
+  {
+   "path": "src/core/storage/types.ts",
+   "upstream_sha": "2afae90a148cb9acd835a5de46a42dbc7f235816",
+   "trimmed_sha": "3e9f98642dc5bbb74da89907de41636574aa842e"
+  },
+  {
+   "path": "src/core/store/sqlite/memory-store.ts",
+   "upstream_sha": "2d31f5682af5ac755857d188d7eba0180e12f749",
+   "trimmed_sha": "0a8a18cf36071fe0ce690b83c094e703da7e95e5"
+  },
+  {
+   "path": "src/core/store/types.ts",
+   "upstream_sha": "3c01dc08f226c60b79e879612323f0cf352636cd",
+   "trimmed_sha": "0154b4a714a5438986791a762f227b7141567625"
+  },
+  {
+   "path": "src/core/tdai-core.ts",
+   "upstream_sha": "e30908187547d981dccbe38c75c23bf5ec1f57eb",
+   "trimmed_sha": "50d37b007a7bae2a0bad3328408a4ccd5f31d589"
+  },
+  {
+   "path": "src/core/types.ts",
+   "upstream_sha": "543114fd3956312186149519a84b1c1e343c0031",
+   "trimmed_sha": "5017aed5413c68f58c1eacf787826ef742454602"
+  },
+  {
+   "path": "src/gateway/config.ts",
+   "upstream_sha": "07e05f829a8590ddfb16d5c76d236dd37e7f7769",
+   "trimmed_sha": "7cf39e27c0d1ed2d422034da94cd9ad1b8a3839d"
+  },
+  {
+   "path": "src/gateway/server.ts",
+   "upstream_sha": "c21c709022ccbc020658dfab9dbfa085676d0956",
+   "trimmed_sha": "ea5e8234a97057b820359b16d8f7aa1848e089c9"
+  },
+  {
+   "path": "src/gateway/v2-router.ts",
+   "upstream_sha": "4d07d0d482869cd68e2a408841af44c6a8bff08f",
+   "trimmed_sha": "3d1cba11c8bd7dbb3137ef8fb6aeec9bc812642c"
+  },
+  {
+   "path": "src/gateway/v2-schemas.ts",
+   "upstream_sha": "4ebea1e2a6f63d2ddfacc03abf655718acf4c298",
+   "trimmed_sha": "93bddf9ead931b2e153e8c837388289aa01530a8"
+  },
+  {
+   "path": "src/utils/pipeline-factory.ts",
+   "upstream_sha": "c38034feea63fc620d1808cddc85499bc8c40f92",
+   "trimmed_sha": "fce95564151d017c9d7b22c54c20af0ffb57a962"
+  },
+  {
+   "path": "src/utils/pipeline-manager.ts",
+   "upstream_sha": "4ec48522dab7fed0f1d4e466ba8b1238df9608d2",
+   "trimmed_sha": "4b70ad35a836905802487bb8a165440c633cc268"
+  },
+  {
+   "path": "src/utils/stateful-pipeline-manager.ts",
+   "upstream_sha": "bcfc7aae4eb0d2c32feb1d6557caa622031e6864",
+   "trimmed_sha": "1169da5071889bae5ac098bd8bf91461d9825e9f"
+  }
+ ],
+ "added": [
+  {
+   "path": "package-lock.json",
+   "trimmed_sha": "a83fe26dd8792bd7e40fcabb237050638d93475d"
+  },
+  {
+   "path": "src/adapters/standalone/memory-file-policy.ts",
+   "trimmed_sha": "d949a2f02669ede1324b5d6727c49eba5a670bf9"
+  },
+  {
+   "path": "src/core/content/generation-history.ts",
+   "trimmed_sha": "4c530226e32de0deb06421ea32db0a6be3dfc8e8"
+  },
+  {
+   "path": "src/core/content/history-contract.ts",
+   "trimmed_sha": "48de73a2efe74b0e514291e6a16d55a0b1286193"
+  },
+  {
+   "path": "src/core/content/history-reader.ts",
+   "trimmed_sha": "8543542804f19f683080fdbb855f32318b280bbd"
+  },
+  {
+   "path": "src/core/content/history-write.ts",
+   "trimmed_sha": "6097e3dca6cd531bbef9f5d67bc256306c134eb6"
+  },
+  {
+   "path": "src/core/content/sources.ts",
+   "trimmed_sha": "b9445491d16a6823d8ead95084c7b6573225a116"
+  },
+  {
+   "path": "src/core/content/types.ts",
+   "trimmed_sha": "888fc2d1432b8ea14142aa1410bdce84f3868044"
+  },
+  {
+   "path": "src/core/memory-generation-log/diagnostics.ts",
+   "trimmed_sha": "00bf4b2eef1d8b5511938e426597cd723814f29f"
+  },
+  {
+   "path": "src/core/memory-prompt/template.ts",
+   "trimmed_sha": "ef48c32f6031021286b73f73e78e5c41801c0707"
+  },
+  {
+   "path": "src/core/record/dedup-isolation.ts",
+   "trimmed_sha": "69d3c8fd7a19c5760d158d696151291b09f64ff5"
+  },
+  {
+   "path": "src/core/storage/generation-workspace.ts",
+   "trimmed_sha": "afa4a2f7f635e06a406218926f2cdbfce95a419d"
+  },
+  {
+   "path": "src/core/storage/local-content-history.ts",
+   "trimmed_sha": "2f2a8122fef212a7c04235199818ca193abda360"
+  },
+  {
+   "path": "src/core/storage/local-published-storage.ts",
+   "trimmed_sha": "639d6ab71433b40d4342a2f227e3bf462153df66"
+  },
+  {
+   "path": "src/core/storage/safe-local-path.ts",
+   "trimmed_sha": "46c5defaaf197e341c0efb58d7420de492a71277"
+  },
+  {
+   "path": "src/core/store/sqlite/content-history.ts",
+   "trimmed_sha": "5667cfa8b8c554561d00f95199b599912e91f3c3"
+  },
+  {
+   "path": "src/gateway/content-history-handlers.ts",
+   "trimmed_sha": "70d82cd9c98c0ff6545a41c234fb1cf7ae5093f7"
+  },
+  {
+   "path": "src/gateway/content-write-handlers.ts",
+   "trimmed_sha": "84404017c898e1af4d9b9b59f1fb3e8932c097a9"
+  }
+ ],
+ "removed": [
+  ".dockerignore",
+  ".npmignore",
+  "Dockerfile",
+  "README.md",
+  "README_CN.md",
+  "SKILL-DIAGNOSTIC-EXPORT.md",
+  "SKILL-MIGRATION.md",
+  "SKILL.md",
+  "bin/export-tencent-vdb.mjs",
+  "bin/migrate-sqlite-to-tcvdb.mjs",
+  "bin/read-local-memory.mjs",
+  "bin/seed-v2.mjs",
+  "docker-compose.local-mongo.yaml",
+  "hermes-plugin/memory/memory_tencentdb/README.md",
+  "hermes-plugin/memory/memory_tencentdb/__init__.py",
+  "hermes-plugin/memory/memory_tencentdb/client.py",
+  "hermes-plugin/memory/memory_tencentdb/plugin.yaml",
+  "hermes-plugin/memory/memory_tencentdb/supervisor.py",
+  "index.ts",
+  "kubb.config.ts",
+  "openclaw-plugin/.gitignore",
+  "openclaw-plugin/README.md",
+  "openclaw-plugin/README_CN.md",
+  "openclaw-plugin/docs/architecture.md",
+  "openclaw-plugin/index.ts",
+  "openclaw-plugin/openclaw.plugin.json",
+  "openclaw-plugin/package.json",
+  "openclaw-plugin/src/format.ts",
+  "openclaw-plugin/src/hooks/capture.ts",
+  "openclaw-plugin/src/hooks/recall.ts",
+  "openclaw-plugin/src/sanitize.ts",
+  "openclaw-plugin/src/tools/conversation-search.ts",
+  "openclaw-plugin/src/tools/memory-search.ts",
+  "openclaw-plugin/src/tools/read-cos.ts",
+  "openclaw-plugin/tsconfig.json",
+  "openclaw.plugin.json",
+  "pi-plugin/.gitignore",
+  "pi-plugin/README.md",
+  "pi-plugin/index.ts",
+  "pi-plugin/package.json",
+  "pi-plugin/tsconfig.json",
+  "pi-plugin/vitest.config.ts",
+  "pnpm-workspace.yaml",
+  "scripts/bench-checkpoint-lock.ts",
+  "scripts/bench-l0-mongo/bench.ts",
+  "scripts/bench-l0-mongo/build-compare.mjs",
+  "scripts/bench-l0-mongo/compare-8c32g.html",
+  "scripts/bench-l0-mongo/generate.ts",
+  "scripts/bench-l0-mongo/index.html",
+  "scripts/bench-l0-mongo/insert.ts",
+  "scripts/bench-l0-mongo/merge-reports.mjs",
+  "scripts/bench-l0-mongo/metrics.ts",
+  "scripts/bench-l0-mongo/parse-qps-log.mjs",
+  "scripts/bench-l0-mongo/probe-ceiling.ts",
+  "scripts/bench-l0-mongo/probe-query-ceiling.ts",
+  "scripts/bench-l0-mongo/query.ts",
+  "scripts/bench-l0-mongo/report.ts",
+  "scripts/bench-l0-mongo/view-report.html",
+  "scripts/ci/check-skill-queue-isolation.sh",
+  "scripts/cleanup-vdb-test-dbs.ts",
+  "scripts/db/mongodb-init.js",
+  "scripts/db/sqlite-init.sql",
+  "scripts/e2e-memory-prompt-vdb-cos.ts",
+  "scripts/export-tencent-vdb/export-tencent-vdb.ts",
+  "scripts/export-tencent-vdb/tsconfig.json",
+  "scripts/import-opik-to-memory-core/README.md",
+  "scripts/import-opik-to-memory-core/index.ts",
+  "scripts/import-opik-to-memory-skill-py/README.md",
+  "scripts/import-opik-to-memory-skill-py/import_opik.py",
+  "scripts/install-hermes-plugin.sh",
+  "scripts/install-openclaw-plugin.sh",
+  "scripts/install_hermes_memory_tencentdb.sh",
+  "scripts/measure-mongo-fts-latency.ts",
+  "scripts/migrate-sqlite-to-tcvdb/README.md",
+  "scripts/migrate-sqlite-to-tcvdb/cli-entry.ts",
+  "scripts/migrate-sqlite-to-tcvdb/config-write.ts",
+  "scripts/migrate-sqlite-to-tcvdb/manifest-write.ts",
+  "scripts/migrate-sqlite-to-tcvdb/node-llama-cpp.d.ts",
+  "scripts/migrate-sqlite-to-tcvdb/sqlite-to-tcvdb.ts",
+  "scripts/migrate-sqlite-to-tcvdb/tsconfig.json",
+  "scripts/migrate-v2-to-v3/README.md",
+  "scripts/migrate-v2-to-v3/README_CN.md",
+  "scripts/migrate-v2-to-v3/v2-to-v3-migrate.py",
+  "scripts/probe-vdb-capacity.ts",
+  "scripts/probe-vdb-reclaimable.ts",
+  "scripts/read-local-memory/read-local-memory.ts",
+  "scripts/read-local-memory/tsconfig.json",
+  "scripts/start-e2e-gateway.ts",
+  "scripts/verify-clear-vs-archive.ts",
+  "scripts/verify-tcvdb-clear.ts",
+  "src/core/persona/persona-generator.ts",
+  "src/core/persona/persona-trigger.ts",
+  "src/core/prompts/persona-generation.ts",
+  "tdai-gateway.local-mongo.yaml",
+  "tdai-gateway.standalone.yaml",
+  "tdai-gateway.yaml",
+  "tsdown.config.ts",
+  "v3-api-memorycore-doc.md",
+  "vitest.config.ts"
+ ]
+}

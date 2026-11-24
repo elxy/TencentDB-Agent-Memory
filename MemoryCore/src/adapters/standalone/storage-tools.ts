@@ -11,6 +11,8 @@
 
 import { tool, jsonSchema } from "ai";
 import type { StorageAdapter } from "../../core/storage/adapter.js";
+import type { MemoryFilePolicy } from "../../core/types.js";
+import { evaluateFilePolicy, filePolicyDeniedResult } from "./memory-file-policy.js";
 
 const TAG = "[memory-tdai] [storage-tools]";
 
@@ -52,11 +54,13 @@ function resolveStorageKey(prefix: string, relativePath: string): string | null 
  * @param storage    - StorageAdapter instance (COS or local backend)
  * @param prefix     - Key prefix acting as sandbox root (e.g. "scene_blocks/")
  * @param logger     - Optional logger for diagnostics
+ * @param filePolicy - Optional layer-specific file policy enforced before any IO
  */
 export function createStorageTools(
   storage: StorageAdapter,
   prefix: string,
   logger?: Logger,
+  filePolicy?: MemoryFilePolicy,
 ) {
   return {
     read: tool({
@@ -71,6 +75,8 @@ export function createStorageTools(
       execute: (async (args: { path: string }) => {
         const key = resolveStorageKey(prefix, args.path);
         if (!key) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
+        const decision = filePolicy ? evaluateFilePolicy(filePolicy, "read", args.path) : null;
+        if (decision && !decision.allowed) return filePolicyDeniedResult(decision);
         try {
           const content = await storage.readFile(key);
           if (content === null) {
@@ -100,6 +106,8 @@ export function createStorageTools(
       execute: (async (args: { path: string; content: string }) => {
         const key = resolveStorageKey(prefix, args.path);
         if (!key) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
+        const decision = filePolicy ? evaluateFilePolicy(filePolicy, "write", args.path) : null;
+        if (decision && !decision.allowed) return filePolicyDeniedResult(decision);
         try {
           await storage.writeFile(key, args.content);
           logger?.debug?.(`${TAG} write: "${args.path}" → ${Buffer.byteLength(args.content, "utf8")} bytes`);
@@ -136,6 +144,8 @@ export function createStorageTools(
       execute: (async (args: { path: string; edits: Array<{ oldText: string; newText: string }> }) => {
         const key = resolveStorageKey(prefix, args.path);
         if (!key) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
+        const decision = filePolicy ? evaluateFilePolicy(filePolicy, "edit", args.path) : null;
+        if (decision && !decision.allowed) return filePolicyDeniedResult(decision);
         if (!args.edits || args.edits.length === 0) return JSON.stringify({ error: "edits array cannot be empty." });
         try {
           const existing = await storage.readFile(key);
@@ -175,7 +185,8 @@ export function createStorageReadOnlyTools(
   storage: StorageAdapter,
   prefix: string,
   logger?: Logger,
+  filePolicy?: MemoryFilePolicy,
 ) {
-  const all = createStorageTools(storage, prefix, logger);
+  const all = createStorageTools(storage, prefix, logger, filePolicy);
   return { read: all.read };
 }

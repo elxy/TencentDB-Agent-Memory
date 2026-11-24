@@ -58,6 +58,58 @@ export interface RuntimeContext {
 }
 
 // ============================
+// LLM file policy
+// ============================
+
+/** File operations exposed by the standalone sandboxed tools. */
+export type FilePolicyOperation = "read" | "write" | "edit";
+
+/**
+ * A single allow rule for the layer-specific LLM file policy.
+ *
+ * A path is permitted for the listed `operations` when it matches `path`
+ * (exact) or `prefix` (path prefix) and satisfies the optional shape guards.
+ * Hidden dot-segments are rejected unless `allowHidden` is set.
+ */
+export interface FilePolicyRule {
+  /** Operations granted by this rule. */
+  operations: readonly FilePolicyOperation[];
+  /** Exact normalized relative path this rule matches (e.g. "persona.md"). */
+  path?: string;
+  /** Normalized relative path prefix this rule matches (e.g. "scene_blocks/"). */
+  prefix?: string;
+  /** When true the matched remainder must be a direct child (no "/"). Default false. */
+  directOnly?: boolean;
+  /** When true the matched basename must end in ".md". Default false. */
+  markdownOnly?: boolean;
+  /** When true dot-segment (hidden) paths are permitted. Default false. */
+  allowHidden?: boolean;
+}
+
+/**
+ * Minimal, reusable, layer-specific file policy for a single LLM run.
+ *
+ * Deny-by-default: a path is allowed only when a rule grants the requested
+ * operation. An absent policy means "no extra restriction".
+ */
+export interface MemoryFilePolicy {
+  /** Stable label used in logs and error messages. */
+  label: string;
+  /** Ordered allow rules. */
+  rules: readonly FilePolicyRule[];
+}
+
+/** Result of evaluating one `(operation, path)` pair against a policy. */
+export interface FilePolicyDecision {
+  /** Whether the operation is permitted. */
+  allowed: boolean;
+  /** Canonical relative path ("" when the raw path was structurally invalid). */
+  normalizedPath: string;
+  /** Human-readable denial reason, when `allowed` is false. */
+  reason?: string;
+}
+
+// ============================
 // LLMRunner
 // ============================
 
@@ -102,6 +154,15 @@ export interface LLMRunParams {
   storage?: import("./storage/adapter.js").StorageAdapter;
   /** Key prefix for storage-backed tools (sandbox boundary). Default: "" */
   storagePrefix?: string;
+  /**
+   * Optional layer-specific file policy for the sandboxed read/write/edit
+   * tools. When set, every tool call is checked after path normalization and
+   * before any IO; denied calls return an error to the model and never touch
+   * the underlying filesystem or StorageAdapter. When set, caller-provided
+   * `tools` are rejected so the policy cannot be bypassed. Undefined preserves
+   * the legacy sandbox-only behaviour.
+   */
+  filePolicy?: MemoryFilePolicy;
   /** Plugin instance ID for metric reporting (optional). */
   instanceId?: string;
   /**

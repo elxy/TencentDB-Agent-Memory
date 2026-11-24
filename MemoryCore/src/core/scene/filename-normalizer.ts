@@ -11,7 +11,7 @@
  *   - URL/path encoding consumers (COS object keys etc).
  *
  * This module renames offenders to a canonical form on disk and lets every
- * other consumer (PersonaGenerator, recall, profile-sync) read the already
+ * other consumer (recall, profile-sync, 主 Agent 读取) read the already
  * sanitized name from scene_index.json — no additional changes needed.
  */
 

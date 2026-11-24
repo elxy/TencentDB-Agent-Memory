@@ -288,3 +288,23 @@ export const StoragePaths = {
   /** Build scene block backup path */
   sceneBlockBackup: (index: number, name: string) => `.backup/scene_blocks/${index}/${name}.md`,
 } as const;
+
+/**
+ * L3 三份文档（2026-10-12 架构，docs/memory-design-proposal.md §5.3）：用户理解、
+ * 信念、当前重点。只由主 Agent 写入（框架按角色配置工具）；Core 自动生成 L3
+ * （原 persona 触发）已撤掉。每份文档有篇幅上限，默认值可配置。
+ */
+export const L3_DOCUMENTS = ["user-understanding.md", "beliefs.md", "current-focus.md"] as const;
+export type L3DocumentName = (typeof L3_DOCUMENTS)[number];
+
+/** 各文档默认篇幅上限（字符数）；可由配置覆盖。 */
+export const L3_DOCUMENT_DEFAULT_LIMITS: Readonly<Record<L3DocumentName, number>> = {
+  "user-understanding.md": 4000,
+  "beliefs.md": 4000,
+  "current-focus.md": 2000,
+};
+
+/** Whether a locator addresses one of the three L3 documents. */
+export function isL3DocumentLocator(locator: string): locator is L3DocumentName {
+  return (L3_DOCUMENTS as readonly string[]).includes(locator);
+}

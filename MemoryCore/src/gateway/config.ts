@@ -105,6 +105,11 @@ export interface WorkerConfig {
   pollMs: number;
   /** 并发消费协程数 (default: 60) */
   concurrency: number;
+  /**
+   * 最大重试次数 (default: 3)。0 = 不重试，首次失败直接进死信。
+   * yaml: worker.maxRetries。不读取环境变量，避免隐式覆盖。
+   */
+  maxRetries: number;
   /** 分布式执行锁 TTL。 */
   lockTtlMs?: number;
   /** PEL 消息可被接管前的 idle 时间，必须大于 lockTtlMs。 */
@@ -561,6 +566,26 @@ export function resolveFileStoreOthersMode(
 }
 
 /**
+ * Resolve `worker.maxRetries`.
+ *
+ * - absent → default 3
+ * - present → must be a non-negative finite integer; booleans and strings are
+ *   rejected (never coerced), so a malformed explicit value fails fast.
+ *
+ * Intentionally yaml-only: there is no environment variable for this field,
+ * so no implicit environment override can silently change retry behaviour.
+ */
+export function resolveWorkerMaxRetries(raw: unknown): number {
+  if (raw === undefined) return 3;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || !Number.isInteger(raw) || raw < 0) {
+    throw new Error(
+      `invalid worker.maxRetries: ${JSON.stringify(raw)} (expected a non-negative finite integer)`,
+    );
+  }
+  return raw;
+}
+
+/**
  * Overrides accepted by {@link loadGatewayConfig} / the TdaiGateway constructor.
  *
  * `server` / `data` / `llm` are merged one level deep onto the parsed base
@@ -811,6 +836,7 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
   const worker: WorkerConfig = {
     pollMs: envInt("WORKER_POLL_MS") ?? num(workerConfig, "pollMs") ?? 200,
     concurrency: envInt("WORKER_CONCURRENCY") ?? num(workerConfig, "concurrency") ?? 60,
+    maxRetries: resolveWorkerMaxRetries(workerConfig["maxRetries"]),
     lockTtlMs: envInt("WORKER_LOCK_TTL_MS") ?? num(workerConfig, "lockTtlMs"),
     pendingStaleMs: envInt("WORKER_PENDING_STALE_MS") ?? num(workerConfig, "pendingStaleMs"),
     pendingRecoveryIntervalMs: envInt("WORKER_PENDING_RECOVERY_INTERVAL_MS") ?? num(workerConfig, "pendingRecoveryIntervalMs"),

@@ -44,6 +44,7 @@ import type {
   L1CountFilter,
   L1PaginatedFilter,
   L1PaginatedResult,
+  L1SupersessionRow,
   IsolationFilter,
   TeamEntity,
   UserEntity,
@@ -57,6 +58,7 @@ import type {
   MemoryContentClearResult,
   AuditEntry,
   AuditQueryFilter,
+  L1SupersededRow,
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../../skill/skill-store-ddl.js";
@@ -75,6 +77,24 @@ import {
   type MemoryGenerationLayer,
   type MemoryGenerationRefRecord,
 } from "../../memory-generation-log/types.js";
+import {
+  ContentHistoryError,
+  ContentHistoryInitError,
+  HistoryDeleteUndefinedError,
+  SqliteContentHistory,
+  buildL0VersionMetadata,
+  buildL1VersionMetadata,
+  canonicalScope,
+  l1HistoryScope,
+  l0HistoryScope,
+} from "./content-history.js";
+import type { AppliedHistoryChange, ContentHistoryStoreEffect } from "./content-history.js";
+import type { ChangeCommit, ChangeCommitResult, ContentVersion, HistoryScope } from "../../content/history-contract.js";
+import {
+  HistoryWriteInputError,
+  assertChangeCommitShape,
+  type CommitContentChangesOptions,
+} from "../../content/history-write.js";
 
 export type { L1RecordRow } from "../types.js";
 
@@ -160,6 +180,40 @@ function requireNodeSqlite(): typeof import("node:sqlite") {
   return require("node:sqlite") as typeof import("node:sqlite");
 }
 
+/** Narrow plain-object test (shared by the version → current-row reconstruction). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Canonical record-semantics keys the version metadata partition owns. They are
+ * written into dedicated columns (never leaked as if they were user metadata)
+ * and are therefore excluded from the reconstructed user-metadata blob when a
+ * version does not carry an explicit `user_metadata` partition.
+ */
+const L1_CANONICAL_METADATA_KEYS: ReadonlySet<string> = new Set([
+  "user_metadata",
+  "type",
+  "priority",
+  "scene_name",
+  "timestamps",
+  "session_key",
+  "session_id",
+  "task_id",
+  "source_message_ids",
+  "_legacy_import",
+]);
+
+/** Every non-canonical metadata key, i.e. the user's original fields. */
+function stripL1CanonicalKeys(meta: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(meta)) {
+    if (L1_CANONICAL_METADATA_KEYS.has(key)) continue;
+    out[key] = meta[key];
+  }
+  return out;
+}
+
 // ============================
 // FTS5 / keyword helpers
 // ============================
@@ -241,6 +295,20 @@ export class VectorStore implements IMemoryStore {
   private closed = false;
 
   /**
+   * Optional content-history co-tenant. Present only when the caller opted in
+   * with the explicit `{ contentHistory: true }` constructor flag; the default
+   * (old mode) is unchanged and does not yet touch user data.
+   */
+  private contentHistory?: SqliteContentHistory;
+  /**
+   * Whether content history is active. Set by the explicit constructor flag,
+   * but also forced on when reopening a database that was persisted as
+   * history-enabled so a restart without the flag cannot silently drop back to
+   * legacy (destructive) writes/deletes.
+   */
+  private contentHistoryEnabled: boolean;
+
+  /**
    * `true` when vec0 virtual tables (l1_vec / l0_vec) have been created and
    * their prepared statements are ready.  When `dimensions === 0` (i.e.
    * provider="none"), vec0 tables are deferred and this stays `false`.
@@ -296,9 +364,10 @@ export class VectorStore implements IMemoryStore {
    * Note: After construction, you MUST call `init()` to load the sqlite-vec
    * extension and create the schema.
    */
-  constructor(dbPath: string, dimensions: number, logger?: Logger) {
+  constructor(dbPath: string, dimensions: number, logger?: Logger, options?: { contentHistory?: boolean }) {
     this.dimensions = dimensions;
     this.logger = logger;
+    this.contentHistoryEnabled = options?.contentHistory === true;
 
     // Ensure parent directory exists (for non-default instance paths)
     const dbDir = path.dirname(dbPath);
@@ -343,6 +412,316 @@ export class VectorStore implements IMemoryStore {
   /** Embedding dimension this store was opened with (0 when provider="none"). */
   getEmbeddingDimensions(): number {
     return this.dimensions;
+  }
+
+  /** Whether the caller explicitly enabled content history at construction. */
+  isContentHistoryEnabled(): boolean {
+    return this.contentHistoryEnabled;
+  }
+
+  /**
+   * The content-history co-tenant (version reads / commit) when enabled.
+   * Undefined in the default legacy mode.
+   */
+  getContentHistory(): SqliteContentHistory | undefined {
+    return this.contentHistory;
+  }
+
+  /**
+   * Whether this database was previously opened with content history enabled.
+   * The marker lives in `content_history_meta`, created by the history schema.
+   */
+  private readHistoryEnabledMarker(): boolean {
+    try {
+      const table = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_history_meta'").get();
+      if (!table) return false;
+      const row = this.db.prepare("SELECT value FROM content_history_meta WHERE key = 'history_enabled'").get() as { value?: string } | undefined;
+      if (!row || row.value !== "1") throw new Error("missing or invalid history_enabled marker");
+      return true;
+    } catch (err) {
+      throw new ContentHistoryInitError(`Cannot verify persisted history mode: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Apply the current-row / recall effect of a bound history commit inside the
+   * SAME open transaction (the history layer never touches the current row by
+   * itself). Only `retire` and `restore` are supported:
+   *
+   *   - retire:  drop the current row + FTS/vector rows so the locator leaves
+   *              every pipeline/recall path, while the immutable retired
+   *              version stays readable through history.
+   *   - restore: rebuild the current row + FTS from the version. A rebuild that
+   *              would need a fresh embedding (vec tables present) is refused,
+   *              so we never publish an active row with no vector index.
+   */
+  private applyHistoryEffect(effect: ContentHistoryStoreEffect): void {
+    const version = effect.version;
+    // Defense in depth: mutations address a global record primary key. Never
+    // delete/overwrite it merely because a history identity passed scope checks.
+    const table = version.layer === "l1" ? "l1_records" : "l0_conversations";
+    if (version.layer === "l0" || version.layer === "l1") {
+      const existing = this.db.prepare(`SELECT * FROM ${table} WHERE record_id = ?`).get(version.locator) as Record<string, unknown> | undefined;
+      const same = existing && [
+        ["team_id", version.scope.team_id || DEFAULT_ISOLATION_ID],
+        ["user_id", version.scope.user_id || DEFAULT_ISOLATION_ID],
+        ["agent_id", version.scope.agent_id || DEFAULT_ISOLATION_ID],
+        ["task_id", version.scope.task_id || ""],
+        ...(version.layer === "l0" ? [["session_id", version.scope.session_id || DEFAULT_ISOLATION_ID]] : []),
+      ].every(([key, value]) => existing[key] === value);
+      if (effect.kind === "retire" ? !same : !!existing) {
+        throw new ContentHistoryError("history_current_conflict", "lifecycle operation does not match the authoritative current record");
+      }
+    }
+    if (version.layer === "l1") {
+      if (effect.kind === "retire") {
+        this.db.prepare("DELETE FROM l1_records WHERE record_id = ?").run(version.locator);
+        if (this.vecTablesReady && this.stmtDeleteVec) this.stmtDeleteVec.run(version.locator);
+        if (this.ftsAvailable) this.stmtL1FtsDelete.run(version.locator);
+        return;
+      }
+      if (this.vecTablesReady) {
+        throw new ContentHistoryError(
+          "history_restore_unsupported",
+          `restore of L1 locator ${version.locator} requires re-embedding; use upsertL1 with an embedding instead`,
+        );
+      }
+      this.rebuildL1CurrentRow(version);
+      return;
+    }
+    if (version.layer === "l0") {
+      if (effect.kind === "retire") {
+        this.db.prepare("DELETE FROM l0_conversations WHERE record_id = ?").run(version.locator);
+        if (this.vecTablesReady && this.stmtL0DeleteVec) this.stmtL0DeleteVec.run(version.locator);
+        if (this.ftsAvailable) this.stmtL0FtsDelete.run(version.locator);
+        return;
+      }
+      if (this.vecTablesReady) {
+        throw new ContentHistoryError(
+          "history_restore_unsupported",
+          `restore of L0 locator ${version.locator} requires re-embedding; use upsertL0 with an embedding instead`,
+        );
+      }
+      this.rebuildL0CurrentRow(version);
+      return;
+    }
+    throw new ContentHistoryError(
+      "history_bound_commit_unsupported",
+      `the store cannot apply a ${effect.kind} effect for layer ${version.layer}`,
+    );
+  }
+
+  /** A global record id cannot move to another history owner on upsert. */
+  private assertHistoryWriteOwner(layer: "l0" | "l1", locator: string, scope: HistoryScope): void {
+    if (!this.contentHistory) return;
+    const table = layer === "l1" ? "l1_records" : "l0_conversations";
+    const row = this.db.prepare(`SELECT * FROM ${table} WHERE record_id = ?`).get(locator) as Record<string, unknown> | undefined;
+    if (!row) return;
+    const expected: Record<string, string> = {
+      team_id: scope.team_id || DEFAULT_ISOLATION_ID, user_id: scope.user_id || DEFAULT_ISOLATION_ID,
+      agent_id: scope.agent_id || DEFAULT_ISOLATION_ID, task_id: scope.task_id || "",
+      ...(layer === "l0" ? { session_id: scope.session_id || DEFAULT_ISOLATION_ID } : {}),
+    };
+    if (Object.entries(expected).some(([key, value]) => row[key] !== value)) {
+      throw new ContentHistoryError("history_scope_mismatch", "cannot move an existing record id to another history scope");
+    }
+  }
+
+  /** Rebuild the L1 current row + FTS from a restored version (no vec rebuild). */
+  private rebuildL1CurrentRow(version: ContentVersion): void {
+    this.writeL1VersionToCurrent(version);
+  }
+
+  /**
+   * Materialise one L1 content version as the current authoritative row + FTS.
+   *
+   * This is the SINGLE way a version becomes the live L1 row: the restore
+   * binding path and the formal commit entry both go through it, so there is
+   * never a second, subtly different reconstruction. Recognised canonical
+   * fields are read from the version metadata; the original user metadata is
+   * preserved verbatim (`user_metadata` when the partitioned shape is present,
+   * otherwise every non-canonical key). No vector is written here — that is the
+   * caller's explicit embedding decision.
+   */
+  private writeL1VersionToCurrent(version: ContentVersion): void {
+    const meta = (version.metadata ?? {}) as Record<string, unknown>;
+    const timestamps = Array.isArray(meta.timestamps)
+      ? meta.timestamps.filter((t): t is string => typeof t === "string")
+      : [];
+    const tsStr = timestamps[0] ?? "";
+    const tsStart = timestamps.length ? timestamps.reduce((a, b) => (a < b ? a : b)) : tsStr;
+    const tsEnd = timestamps.length ? timestamps.reduce((a, b) => (a > b ? a : b)) : tsStr;
+    const sessionId = typeof meta.session_id === "string" && meta.session_id ? meta.session_id : DEFAULT_ISOLATION_ID;
+    const sessionKey = typeof meta.session_key === "string" ? meta.session_key : "";
+    const type = typeof meta.type === "string" ? meta.type : "";
+    const priority = typeof meta.priority === "number" ? meta.priority : Number(meta.priority) || 0;
+    const sceneName = typeof meta.scene_name === "string" ? meta.scene_name : "";
+    const taskId = typeof meta.task_id === "string" ? meta.task_id : "";
+    const sources = Array.isArray(meta.source_message_ids)
+      ? meta.source_message_ids.filter((v): v is string => typeof v === "string")
+      : [];
+    const userMeta = isPlainObject(meta.user_metadata) ? meta.user_metadata : stripL1CanonicalKeys(meta);
+    const teamId = version.scope.team_id || DEFAULT_ISOLATION_ID;
+    const userId = version.scope.user_id || DEFAULT_ISOLATION_ID;
+    const agentId = version.scope.agent_id || DEFAULT_ISOLATION_ID;
+
+    this.stmtUpsertMeta.run(
+      version.locator,
+      version.body,
+      type,
+      priority,
+      sceneName,
+      sessionKey,
+      sessionId,
+      teamId,
+      taskId,
+      0,
+      tsStr,
+      tsStart,
+      tsEnd,
+      version.recorded_at,
+      version.recorded_at,
+      JSON.stringify(userMeta),
+      userId,
+      agentId,
+      JSON.stringify(sources),
+    );
+    if (this.ftsAvailable) {
+      this.stmtL1FtsDelete.run(version.locator);
+      this.stmtL1FtsInsert.run(
+        tokenizeForFts(version.body),
+        version.body,
+        version.locator,
+        type,
+        priority,
+        sceneName,
+        sessionKey,
+        sessionId,
+        teamId,
+        taskId,
+        userId,
+        agentId,
+        0,
+        tsStr,
+        tsStart,
+        tsEnd,
+        JSON.stringify(userMeta),
+      );
+    }
+  }
+
+  /** Rebuild the L0 current row + FTS from a restored version (no vec rebuild). */
+  private rebuildL0CurrentRow(version: ContentVersion): void {
+    this.writeL0VersionToCurrent(version);
+  }
+
+  /**
+   * Materialise one L0 content version as the current authoritative row + FTS.
+   * Single reconstruction shared by the restore binding path and the formal
+   * commit entry. No vector is written here.
+   */
+  private writeL0VersionToCurrent(version: ContentVersion): void {
+    const meta = (version.metadata ?? {}) as Record<string, unknown>;
+    const sessionKey = typeof meta.session_key === "string" ? meta.session_key : "";
+    const sessionId = typeof meta.session_id === "string" && meta.session_id ? meta.session_id : DEFAULT_ISOLATION_ID;
+    const role = typeof meta.role === "string" ? meta.role : "";
+    const taskId = typeof meta.task_id === "string" ? meta.task_id : "";
+    const recordedAt = typeof meta.message_recorded_at === "string" ? meta.message_recorded_at : version.recorded_at;
+    const timestamp = typeof meta.original_timestamp_ms === "number" ? meta.original_timestamp_ms : Number(meta.original_timestamp_ms) || 0;
+    const teamId = version.scope.team_id || DEFAULT_ISOLATION_ID;
+    const userId = version.scope.user_id || DEFAULT_ISOLATION_ID;
+    const agentId = version.scope.agent_id || DEFAULT_ISOLATION_ID;
+
+    const source = typeof meta.source === "string" && meta.source ? meta.source : "conversation";
+
+    this.stmtL0UpsertMeta.run(
+      version.locator,
+      sessionKey,
+      sessionId,
+      teamId,
+      taskId,
+      role,
+      source,
+      version.body,
+      recordedAt,
+      timestamp,
+      userId,
+      agentId,
+    );
+    if (this.ftsAvailable) {
+      this.stmtL0FtsDelete.run(version.locator);
+      this.stmtL0FtsInsert.run(
+        tokenizeForFts(version.body),
+        version.body,
+        version.locator,
+        sessionKey,
+        sessionId,
+        teamId,
+        taskId,
+        userId,
+        agentId,
+        role,
+        recordedAt,
+        timestamp,
+      );
+    }
+  }
+
+  /** L1 content-identity scope (session excluded — see l1HistoryScope). */
+  private l1ScopeFor(record: MemoryRecord): HistoryScope {
+    return l1HistoryScope({
+      teamId: (record as MemoryRecord & { teamId?: string }).teamId || DEFAULT_ISOLATION_ID,
+      userId: (record as MemoryRecord & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
+      agentId: (record as MemoryRecord & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
+      taskId: record.taskId || "",
+    });
+  }
+
+  /** L0 message scope (includes session). */
+  private l0ScopeFor(record: L0Record): HistoryScope {
+    return l0HistoryScope({
+      teamId: record.teamId || DEFAULT_ISOLATION_ID,
+      userId: record.userId || DEFAULT_ISOLATION_ID,
+      agentId: record.agentId || DEFAULT_ISOLATION_ID,
+      taskId: record.taskId || "",
+      sessionId: record.sessionId || DEFAULT_ISOLATION_ID,
+    });
+  }
+
+  /**
+   * Complete content metadata for an L1 version. The ORIGINAL record semantics
+   * (type / priority / scene / timestamps / session / sources) are recorded as
+   * canonical fields (written last so a user metadata key of the same name can
+   * never shadow them). System-only fields (updatedAt / record version) are NOT
+   * stored so a clock-only touch never fabricates a revision.
+   */
+  private l1HistoryMetadata(record: MemoryRecord): Record<string, unknown> {
+    const sources = Array.isArray(record.source_message_ids)
+      ? record.source_message_ids.filter((v): v is string => typeof v === "string")
+      : [];
+    return buildL1VersionMetadata(record.metadata as Record<string, unknown> | undefined, {
+      type: record.type,
+      priority: typeof record.priority === "number" ? record.priority : 0,
+      sceneName: record.scene_name ?? "",
+      timestamps: Array.isArray(record.timestamps) ? record.timestamps.filter((t): t is string => typeof t === "string") : [],
+      sessionKey: record.sessionKey ?? "",
+      sessionId: record.sessionId ?? "",
+      taskId: record.taskId ?? "",
+      sourceMessageIds: sources,
+    });
+  }
+
+  /** Complete content metadata for an L0 version (same shape as its baseline). */
+  private l0HistoryMetadata(record: L0Record): Record<string, unknown> {
+    return buildL0VersionMetadata(null, {
+      role: record.role,
+      source: record.source ?? "conversation",
+      sessionKey: record.sessionKey,
+      sessionId: record.sessionId ?? "",
+      taskId: record.taskId ?? "",
+      messageRecordedAt: record.recordedAt,
+      originalTimestampMs: record.timestamp,
+    });
   }
 
   /**
@@ -391,6 +770,12 @@ export class VectorStore implements IMemoryStore {
     try {
       return this.initSchema(providerInfo);
     } catch (err) {
+      // An enabled content history that cannot be initialised must NOT be
+      // silently degraded into a "success" — that would either drop the history
+      // guarantee or re-open the legacy write/delete path. Surface it instead.
+      if (err instanceof ContentHistoryInitError || (err instanceof Error && (err as { code?: string }).code === "history_init_failed")) {
+        throw err;
+      }
       const message = err instanceof Error ? err.message : String(err);
       this.logger?.error(
         `${TAG} Schema initialization failed: ${message}. ` +
@@ -499,7 +884,8 @@ export class VectorStore implements IMemoryStore {
         timestamp_end TEXT DEFAULT '',
         created_time TEXT DEFAULT '',
         updated_time TEXT DEFAULT '',
-        metadata_json TEXT DEFAULT '{}'
+        metadata_json TEXT DEFAULT '{}',
+        source_message_ids_json TEXT DEFAULT '[]'
       )
     `);
 
@@ -510,6 +896,8 @@ export class VectorStore implements IMemoryStore {
     try { this.db.exec("ALTER TABLE l1_records ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'default'"); } catch { /* exists */ }
     try { this.db.exec("ALTER TABLE l1_records ADD COLUMN task_id TEXT DEFAULT ''"); } catch { /* exists */ }
     try { this.db.exec("ALTER TABLE l1_records ADD COLUMN version INTEGER NOT NULL DEFAULT 0"); } catch { /* exists */ }
+    if (!(this.db.prepare("PRAGMA table_info(l1_records)").all() as Array<{name:string}>).some(column => column.name === "source_message_ids_json")) this.db.exec("ALTER TABLE l1_records ADD COLUMN source_message_ids_json TEXT DEFAULT '[]'");
+    this.db.prepare("UPDATE l1_records SET source_message_ids_json = '[]' WHERE source_message_ids_json IS NULL").run();
     this.db.prepare("UPDATE l1_records SET team_id = ? WHERE team_id = '' OR team_id IS NULL").run(DEFAULT_ISOLATION_ID);
     this.db.prepare("UPDATE l1_records SET user_id = ? WHERE user_id = '' OR user_id IS NULL").run(DEFAULT_ISOLATION_ID);
     this.db.prepare("UPDATE l1_records SET agent_id = ? WHERE agent_id = '' OR agent_id IS NULL").run(DEFAULT_ISOLATION_ID);
@@ -556,8 +944,8 @@ export class VectorStore implements IMemoryStore {
         record_id, content, type, priority, scene_name, session_key, session_id,
         team_id, task_id, version, timestamp_str, timestamp_start, timestamp_end,
         created_time, updated_time, metadata_json,
-        user_id, agent_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        user_id, agent_id, source_message_ids_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(record_id) DO UPDATE SET
         content=excluded.content,
         type=excluded.type,
@@ -572,7 +960,8 @@ export class VectorStore implements IMemoryStore {
         updated_time=excluded.updated_time,
         metadata_json=excluded.metadata_json,
         user_id=excluded.user_id,
-        agent_id=excluded.agent_id
+        agent_id=excluded.agent_id,
+        source_message_ids_json=excluded.source_message_ids_json
     `);
 
     if (this.dimensions > 0) {
@@ -612,6 +1001,7 @@ export class VectorStore implements IMemoryStore {
         user_id TEXT NOT NULL DEFAULT 'default',
         agent_id TEXT NOT NULL DEFAULT 'default',
         role TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'conversation',
         message_text TEXT NOT NULL,
         recorded_at TEXT DEFAULT '',
         timestamp INTEGER DEFAULT 0
@@ -628,6 +1018,7 @@ export class VectorStore implements IMemoryStore {
     try { this.db.exec("ALTER TABLE l0_conversations ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'"); } catch { /* exists */ }
     try { this.db.exec("ALTER TABLE l0_conversations ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'default'"); } catch { /* exists */ }
     try { this.db.exec("ALTER TABLE l0_conversations ADD COLUMN task_id TEXT DEFAULT ''"); } catch { /* exists */ }
+    try { this.db.exec("ALTER TABLE l0_conversations ADD COLUMN source TEXT NOT NULL DEFAULT 'conversation'"); } catch { /* exists */ }
     this.db.prepare("UPDATE l0_conversations SET team_id = ? WHERE team_id = '' OR team_id IS NULL").run(DEFAULT_ISOLATION_ID);
     this.db.prepare("UPDATE l0_conversations SET user_id = ? WHERE user_id = '' OR user_id IS NULL").run(DEFAULT_ISOLATION_ID);
     this.db.prepare("UPDATE l0_conversations SET agent_id = ? WHERE agent_id = '' OR agent_id IS NULL").run(DEFAULT_ISOLATION_ID);
@@ -673,11 +1064,12 @@ export class VectorStore implements IMemoryStore {
     // user_id / agent_id appended at the end of the bind list (see upsertL0()).
     this.stmtL0UpsertMeta = this.db.prepare(`
       INSERT INTO l0_conversations (
-        record_id, session_key, session_id, team_id, task_id, role, message_text, recorded_at, timestamp,
+        record_id, session_key, session_id, team_id, task_id, role, source, message_text, recorded_at, timestamp,
         user_id, agent_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(record_id) DO UPDATE SET
         message_text=excluded.message_text,
+        source=excluded.source,
         recorded_at=excluded.recorded_at,
         timestamp=excluded.timestamp,
         team_id=excluded.team_id,
@@ -924,6 +1316,43 @@ export class VectorStore implements IMemoryStore {
       );
       CREATE INDEX IF NOT EXISTS idx_memory_generation_refs_memory
         ON memory_generation_refs(layer, memory_id);
+
+      CREATE TABLE IF NOT EXISTS l1_replacements (
+        new_record_id TEXT NOT NULL,
+        old_record_id TEXT NOT NULL,
+        action        TEXT NOT NULL,
+        team_id       TEXT,
+        user_id       TEXT,
+        agent_id      TEXT,
+        task_id       TEXT,
+        session_key   TEXT,
+        session_id    TEXT,
+        replaced_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (new_record_id, old_record_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_l1_replacements_new ON l1_replacements(new_record_id);
+      CREATE INDEX IF NOT EXISTS idx_l1_replacements_old ON l1_replacements(old_record_id);
+
+      -- Supersession history with the FULL old row content (record_json).
+      -- The relation row alone (l1_replacements) cannot answer "what was the
+      -- previous memory?", which correction/audit needs. Same transaction as
+      -- the new row and the old-row deletion.
+      CREATE TABLE IF NOT EXISTS l1_supersessions (
+        old_id           TEXT PRIMARY KEY,
+        new_id           TEXT NOT NULL,
+        layer            TEXT NOT NULL DEFAULT 'L1',
+        action           TEXT NOT NULL,
+        record_json      TEXT NOT NULL,
+        team_id          TEXT,
+        user_id          TEXT,
+        agent_id         TEXT,
+        task_id          TEXT,
+        session_key      TEXT,
+        session_id       TEXT,
+        superseded_at_ms INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_l1_supersessions_new ON l1_supersessions(new_id);
+      CREATE INDEX IF NOT EXISTS idx_l1_supersessions_old ON l1_supersessions(old_id);
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_audit_time      ON memory_audit(updated_at_ms)");
 
@@ -1048,6 +1477,41 @@ export class VectorStore implements IMemoryStore {
       });
     }
 
+    // ── Content history (explicit opt-in, sticky across restarts) ──
+    // Reuses the SAME connection so current rows, versions, replacement
+    // relations and FTS/vector rows share one transaction. A pre-existing
+    // non-empty DB is imported only as an explicitly incomplete baseline; the
+    // old l1_supersessions table keeps serving the legacy read API untouched.
+    //
+    // If the DB was ever explicitly enabled, a later open WITHOUT the flag must
+    // not silently fall back to legacy (destructive) writes/deletes, so the
+    // persisted marker forces history on.
+    const persistedHistoryEnabled = this.readHistoryEnabledMarker();
+    const historyEnabled = this.contentHistoryEnabled || persistedHistoryEnabled;
+    if (historyEnabled) {
+      try {
+        this.contentHistory = new SqliteContentHistory(this.db, {
+          clock: () => new Date().toISOString(),
+          // Bound: direct commits that cannot update the current row/FTS/vector
+          // in-transaction are refused; retire/restore apply through this binding.
+          storeBinding: { applyHistoryEffect: (effect) => this.applyHistoryEffect(effect) },
+        });
+        this.contentHistoryEnabled = true;
+        this.contentHistory.markEnabled();
+        const baseline = this.contentHistory.importBaseline();
+        if (baseline.imported) {
+          this.logger?.info?.(
+            `${TAG} Content history enabled: imported legacy baseline ` +
+            `(L1=${baseline.l1Count}, L0=${baseline.l0Count}, history_complete=false)`,
+          );
+        }
+      } catch (err) {
+        throw new ContentHistoryInitError(
+          `content history is enabled but could not be initialised: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     // Mark vec0 tables as ready only when they were actually created
     this.vecTablesReady = this.dimensions > 0;
     // L1 query statements (for l1-reader)
@@ -1056,7 +1520,7 @@ export class VectorStore implements IMemoryStore {
     const l1QueryCols = `record_id, content, type, priority, scene_name, session_key, session_id,
       team_id, task_id, user_id, agent_id, version,
       timestamp_str, timestamp_start, timestamp_end,
-      created_time, updated_time, metadata_json`;
+      created_time, updated_time, metadata_json, source_message_ids_json`;
 
     this.stmtQueryBySessionId = this.db.prepare(`
       SELECT ${l1QueryCols} FROM l1_records
@@ -1231,6 +1695,7 @@ export class VectorStore implements IMemoryStore {
 
       this.db.exec("BEGIN");
       try {
+        this.assertHistoryWriteOwner("l1", recordId, this.l1ScopeFor(record));
         // Upsert metadata (INSERT OR UPDATE).
         // user_id / agent_id appended at the end to match the prepared statement
         // column order added by the isolation migration. We tolerate undefined
@@ -1256,6 +1721,7 @@ export class VectorStore implements IMemoryStore {
           JSON.stringify(record.metadata),
           (record as MemoryRecord & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
           (record as MemoryRecord & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
+          JSON.stringify(Array.isArray(record.source_message_ids) ? record.source_message_ids : []),
         );
 
         if (!skipVec) {
@@ -1299,6 +1765,21 @@ export class VectorStore implements IMemoryStore {
               `${TAG} [L1-upsert] FTS write failed (non-fatal) id=${recordId}: ${ftsErr instanceof Error ? ftsErr.message : String(ftsErr)}`,
             );
           }
+        }
+
+        // Content history: the current row and its version commit together.
+        // A history failure (e.g. an attempt to re-activate a retired identity)
+        // rolls the whole upsert back — the store never publishes a row that
+        // has no matching version.
+        if (this.contentHistory) {
+          this.contentHistory.recordStoreWrite({
+            layer: "l1",
+            locator: recordId,
+            scope: this.l1ScopeFor(record),
+            body: record.content,
+            metadata: this.l1HistoryMetadata(record),
+            state: "active",
+          });
         }
 
         this.db.exec("COMMIT");
@@ -1443,6 +1924,7 @@ export class VectorStore implements IMemoryStore {
    * **Fault-tolerant**: logs a warning on failure, never throws.
    */
   deleteL1(recordId: string, filter?: IsolationFilter): boolean {
+    if (this.contentHistoryEnabled) throw new HistoryDeleteUndefinedError("deleteL1");
     if (this.degraded) return false;
     try {
       if (filter) {
@@ -1479,6 +1961,7 @@ export class VectorStore implements IMemoryStore {
    * **Fault-tolerant**: logs a warning on failure, never throws.
    */
   deleteL1Batch(recordIds: string[], filter?: IsolationFilter): boolean {
+    if (this.contentHistoryEnabled) throw new HistoryDeleteUndefinedError("deleteL1Batch");
     if (this.degraded) return false;
     if (recordIds.length === 0) return true;
 
@@ -1512,6 +1995,47 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  // ── Persistent old→new replacement history ──
+
+  queryL1ReplacementTargets(newRecordId: string): string[] {
+    if (this.degraded) return [];
+    try {
+      const rows = this.db
+        .prepare(
+          "SELECT old_record_id FROM l1_replacements WHERE new_record_id = ? ORDER BY replaced_at_ms ASC",
+        )
+        .all(newRecordId) as Array<{ old_record_id: string }>;
+      return rows.map((r) => r.old_record_id);
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} queryL1ReplacementTargets failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Supersession history including the full old-row content captured inside the
+   * atomic replace transaction. Backed by `l1_supersessions`, so old content is
+   * queryable without depending on the JSONL mirror or logs.
+   */
+  queryL1Supersessions(newRecordId: string): L1SupersessionRow[] {
+    if (this.degraded) return [];
+    try {
+      return this.db
+        .prepare(
+          "SELECT old_id, new_id, action, record_json, superseded_at_ms " +
+            "FROM l1_supersessions WHERE new_id = ? ORDER BY superseded_at_ms ASC",
+        )
+        .all(newRecordId) as unknown as L1SupersessionRow[];
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} queryL1Supersessions failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
   /**
    * Get the total number of L1 records in the store.
    *
@@ -1522,6 +2046,7 @@ export class VectorStore implements IMemoryStore {
    * in a single transaction to guarantee consistency.
    */
   deleteL1Expired(cutoffIso: string): number {
+    if (this.contentHistoryEnabled) throw new HistoryDeleteUndefinedError("deleteL1Expired");
     if (this.degraded) {
       this.logger?.warn(`${TAG} [deleteExpired] SKIPPED (degraded mode)`);
       return 0;
@@ -1685,6 +2210,7 @@ export class VectorStore implements IMemoryStore {
       if (filter?.userId !== undefined) rows = rows.filter((r) => r.user_id === filter.userId);
       if (filter?.agentId !== undefined) rows = rows.filter((r) => r.agent_id === filter.agentId);
       if (taskId !== undefined) rows = rows.filter((r) => r.task_id === taskId);
+      if (filter?.recordIds) { const ids = new Set(filter.recordIds); rows = rows.filter(row => ids.has(row.record_id)); }
 
       this.logger?.info(
         `${TAG} [L1-query] filter={sessionKey=${sessionKey ?? "(all)"}, sessionId=${sessionId ?? "(all)"}, teamId=${filter?.teamId ?? "(all)"}, userId=${filter?.userId ?? "(all)"}, agentId=${filter?.agentId ?? "(all)"}, taskId=${taskId ?? "(all)"}, updatedAfter=${updatedAfter ?? "(none)"}}, ` +
@@ -1695,6 +2221,329 @@ export class VectorStore implements IMemoryStore {
       this.logger?.warn(
         `${TAG} [L1-query] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`
       );
+      return [];
+    }
+  }
+
+  /**
+   * Read one L1 record by primary key with identity filtering.
+   * Absent OR out-of-scope both return `null` — existence never leaks.
+   */
+  getL1RecordById(recordId: string, filter?: IsolationFilter): L1RecordRow | null {
+    if (this.degraded) return null;
+    try {
+      const row = this.db.prepare(`
+        SELECT record_id, content, type, priority, scene_name, session_key, session_id,
+               team_id, task_id, user_id, agent_id, version,
+               timestamp_str, timestamp_start, timestamp_end,
+               created_time, updated_time, metadata_json, source_message_ids_json
+        FROM l1_records WHERE record_id = ?
+      `).get(recordId) as unknown as L1RecordRow | undefined;
+      if (!row) return null;
+      if (!rowMatchesIsolation(row, filter)) return null;
+      return row;
+    } catch (err) {
+      throw new Error(`L1 content read failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Read an archived (superseded) L1 record by its old id with identity filtering. */
+  getL1SupersededRecord(oldId: string, filter?: IsolationFilter): L1SupersededRow | null {
+    if (this.degraded) return null;
+    try {
+      const row = this.db.prepare("SELECT * FROM l1_supersessions WHERE old_id = ?").get(oldId) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      if (!rowMatchesIsolation(row as { team_id?: string; user_id?: string; agent_id?: string; session_id?: string; task_id?: string; session_key?: string }, filter)) return null;
+      const old = JSON.parse(String(row.record_json)) as MemoryRecord;
+      return {
+        old_id: String(row.old_id), new_id: String(row.new_id),
+        content: old.content, type: old.type, priority: old.priority, scene_name: old.scene_name,
+        session_key: old.sessionKey, session_id: old.sessionId ?? "default",
+        team_id: old.teamId ?? "default", task_id: old.taskId ?? "",
+        user_id: old.userId ?? "default", agent_id: old.agentId ?? "default",
+        source_message_ids: old.source_message_ids, metadata_json: JSON.stringify(old.metadata),
+        version: old.version, created_time: old.createdAt, updated_time: old.updatedAt,
+        superseded_at_ms: Number(row.superseded_at_ms),
+      };
+    } catch (err) {
+      throw new Error(`L1 historical content read failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // ── Formal content commit entry (history-aware, one transaction) ──
+
+  /**
+   * Apply one `ChangeCommit` of L0/L1 mutations so the current row, its FTS /
+   * vector index and the immutable content-history version commit together in a
+   * SINGLE SQLite transaction. This is the ONLY history-aware write entry: a
+   * caller must never pre-check a version and then call the legacy upsert.
+   *
+   * Contract (each item is re-checked INSIDE the transaction, never on an outer
+   * read that could be stale):
+   *   - `operation_id` de-duplication is per scope: the same payload returns the
+   *     exact same result without writing a second version; a different payload
+   *     conflicts.
+   *   - `expected_version_id` / `predecessors` are compared against the store's
+   *     own `content_current`; a stale or non-current predecessor is refused.
+   *   - every mutation scope must equal the trusted `filter` identity (team /
+   *     user / agent, + task, + session for L0) — a record primary key can never
+   *     be moved to another owner.
+   *   - a new identity's locator must be free; an existing identity's store row
+   *     must still match its history body, so a divergent row is refused rather
+   *     than silently overwritten.
+   *   - `baseline` is refused: this store cannot faithfully apply it (it is an
+   *     import-time construct).
+   *
+   * `options.embeddings` (keyed by `draft.locator`) supplies the vectors for the
+   * new current rows; a locator without one is written metadata+FTS only — the
+   * store never fabricates a placeholder vector.
+   *
+   * Returns the committed result; throws (rolling everything back) on any
+   * conflict. Never partially applies a commit.
+   */
+  commitContentChanges(
+    commit: ChangeCommit,
+    filter: IsolationFilter,
+    options?: CommitContentChangesOptions,
+  ): ChangeCommitResult {
+    if (this.degraded) {
+      throw new ContentHistoryError("history_write_degraded", "content commit refused: store is degraded");
+    }
+    if (!this.contentHistory) {
+      throw new ContentHistoryError(
+        "history_not_enabled",
+        "commitContentChanges requires content history to be enabled for this store",
+      );
+    }
+    try {
+      assertChangeCommitShape(commit);
+    } catch (err) {
+      if (err instanceof HistoryWriteInputError) throw new ContentHistoryError(err.code, err.message);
+      throw err;
+    }
+
+    // Only L0/L1 current rows live in this store; L2/L3 belong to the local planner.
+    const layers = new Set(commit.mutations.map((m) => m.draft.layer));
+    if (layers.size !== 1) {
+      throw new ContentHistoryError("history_scope_mismatch", "a single store commit must target exactly one layer");
+    }
+    const layer = [...layers][0];
+    if (layer !== "l0" && layer !== "l1") {
+      throw new ContentHistoryError(
+        "history_layer_unsupported",
+        `commitContentChanges only applies L0/L1 mutations; layer ${layer} belongs to the local L2/L3 planner`,
+      );
+    }
+    // One commit, one object scope; every mutation scope must match the trusted filter.
+    const scopeKeys = new Set(commit.mutations.map((m) => canonicalScope(m.draft.scope).scopeKey));
+    if (scopeKeys.size !== 1) {
+      throw new ContentHistoryError("history_scope_mismatch", "a single commit may only touch one scope");
+    }
+    for (const mutation of commit.mutations) {
+      // Every mutation shares the single layer verified above; using the narrowed
+      // `layer` keeps an L2/L3 mutation type from reaching the L0/L1-only path.
+      this.assertMutationScopeAuthorized(layer, mutation.draft.scope, filter);
+    }
+
+    const embeddings = options?.embeddings;
+    const history = this.contentHistory;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = history.commitChanges(commit, {
+        inTransaction: true,
+        applyStoreChange: (change) =>
+          this.applyStoreHistoryChange(change, filter, embeddings),
+      });
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* ignore rollback errors */
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * A mutation may only address an object scope that exactly equals the trusted
+   * identity. Missing dimensions are NOT wildcards: they resolve to the same
+   * default bucket the store writes, so an omitted request dimension can never
+   * address another owner's records.
+   */
+  private assertMutationScopeAuthorized(layer: "l0" | "l1", scope: HistoryScope, filter: IsolationFilter): void {
+    const expected: Record<string, string> = {
+      team_id: filter.teamId || DEFAULT_ISOLATION_ID,
+      user_id: filter.userId || DEFAULT_ISOLATION_ID,
+      agent_id: filter.agentId || DEFAULT_ISOLATION_ID,
+    };
+    if (layer === "l0") expected.session_id = filter.sessionId || DEFAULT_ISOLATION_ID;
+    const clean = canonicalScope(scope).scope as Record<string, string>;
+    for (const [key, value] of Object.entries(expected)) {
+      if (clean[key] !== value) {
+        throw new ContentHistoryError(
+          "history_scope_mismatch",
+          `mutation scope.${key} does not match the trusted identity`,
+        );
+      }
+    }
+    if ((clean.task_id ?? "") !== (filter.taskId ?? "")) {
+      throw new ContentHistoryError("history_scope_mismatch", "mutation scope.task_id does not match the trusted identity");
+    }
+    const allowed = new Set([...Object.keys(expected), "task_id"]);
+    for (const key of Object.keys(clean)) {
+      if (!allowed.has(key)) {
+        throw new ContentHistoryError("history_scope_mismatch", `mutation scope carries an unauthorized dimension "${key}"`);
+      }
+    }
+  }
+
+  /**
+   * Apply one freshly recorded version to the current L0/L1 row + FTS + vector
+   * index, inside the caller's open transaction. Throws (rolling the whole
+   * commit back) whenever it cannot apply the effect faithfully.
+   */
+  private applyStoreHistoryChange(
+    change: AppliedHistoryChange,
+    filter: IsolationFilter,
+    embeddings: Map<string, Float32Array> | undefined,
+  ): void {
+    const version = change.version;
+    const layer = version.layer;
+    if (layer !== "l0" && layer !== "l1") {
+      throw new ContentHistoryError("history_layer_unsupported", `store cannot apply a ${layer} change`);
+    }
+    this.assertMutationScopeAuthorized(layer, version.scope, filter);
+
+    if (change.change_kind === "retire") {
+      // The exact cognition leaving the read path must be the current row.
+      this.assertStoreRowMatchesVersion(layer, version.locator, version.body, filter, "retire");
+      this.deleteStoreRecord(layer, version.locator);
+      return;
+    }
+
+    // A new identity must not hijack an occupied locator.
+    if (change.change_kind === "create") {
+      if (this.getStoreRow(layer, version.locator)) {
+        throw new ContentHistoryError(
+          "history_locator_conflict",
+          `locator ${version.locator} already addresses a current row`,
+        );
+      }
+    }
+
+    // Consumed / overwritten predecessors must still be the store's current row
+    // and carry the body the version recorded; otherwise history and the row
+    // have already diverged and we refuse to guess which one is authoritative.
+    for (const predecessor of change.predecessors) {
+      if (!predecessor.locator || predecessor.locator === version.locator) continue;
+      this.assertStoreRowMatchesVersion(layer, predecessor.locator, predecessor.body, filter, change.change_kind);
+    }
+    if (change.change_kind === "revise" && change.predecessors[0]) {
+      const predecessor = change.predecessors[0];
+      if (predecessor.locator && predecessor.locator !== version.locator) {
+        // Auto–update publishes the identity at a NEW locator. The predecessor's
+        // current row was verified above; move the live row to the new locator
+        // and drop the old row, while the OLD locator keeps its history mapping
+        // to the OLD version (so the old record id still resolves to old bytes).
+        if (this.getStoreRow(layer, version.locator)) {
+          throw new ContentHistoryError(
+            "history_locator_conflict",
+            `locator ${version.locator} already addresses a current row`,
+          );
+        }
+        this.deleteStoreRecord(layer, predecessor.locator);
+      } else {
+        this.assertStoreRowMatchesVersion(layer, version.locator, predecessor.body, filter, "revise");
+      }
+    } else if (change.change_kind === "restore") {
+      // The retired row is absent by construction; a present row must be ours.
+      const existing = this.getStoreRow(layer, version.locator);
+      if (existing && !rowMatchesIsolation(existing, filter)) {
+        throw new ContentHistoryError(
+          "history_scope_mismatch",
+          `restore locator ${version.locator} is held by another owner`,
+        );
+      }
+    }
+
+    // Write the new current row + FTS (and the vector when the caller supplied one).
+    if (layer === "l1") this.writeL1VersionToCurrent(version);
+    else this.writeL0VersionToCurrent(version);
+    this.writeVersionVec(layer, version.locator, embeddings?.get(version.locator), version.recorded_at);
+  }
+
+  /** Read one raw current row (no isolation projection) for a mutation target. */
+  private getStoreRow(layer: "l0" | "l1", locator: string): Record<string, unknown> | undefined {
+    const table = layer === "l1" ? "l1_records" : "l0_conversations";
+    return this.db.prepare(`SELECT * FROM ${table} WHERE record_id = ?`).get(locator) as Record<string, unknown> | undefined;
+  }
+
+  /**
+   * The current row a mutation would overwrite/consume must exist, lie inside
+   * the trusted identity and still carry the history version's exact body.
+   */
+  private assertStoreRowMatchesVersion(
+    layer: "l0" | "l1",
+    locator: string,
+    expectedBody: string,
+    filter: IsolationFilter,
+    kind: string,
+  ): void {
+    const row = this.getStoreRow(layer, locator);
+    if (!row) {
+      throw new ContentHistoryError("history_current_diverged", `${kind} target ${locator} has no current row`);
+    }
+    if (!rowMatchesIsolation(row, filter)) {
+      throw new ContentHistoryError("history_scope_mismatch", `${kind} target ${locator} is outside the trusted identity`);
+    }
+    const body = layer === "l1" ? String(row.content ?? "") : String(row.message_text ?? "");
+    if (body !== expectedBody) {
+      throw new ContentHistoryError(
+        "history_current_diverged",
+        `${kind} target ${locator} content disagrees with its recorded history version`,
+      );
+    }
+  }
+
+  /** Remove a current row and its recall index rows (the version is kept). */
+  private deleteStoreRecord(layer: "l0" | "l1", locator: string): void {
+    if (layer === "l1") {
+      this.db.prepare("DELETE FROM l1_records WHERE record_id = ?").run(locator);
+      if (this.vecTablesReady && this.stmtDeleteVec) this.stmtDeleteVec.run(locator);
+      if (this.ftsAvailable) this.stmtL1FtsDelete.run(locator);
+    } else {
+      this.db.prepare("DELETE FROM l0_conversations WHERE record_id = ?").run(locator);
+      if (this.vecTablesReady && this.stmtL0DeleteVec) this.stmtL0DeleteVec.run(locator);
+      if (this.ftsAvailable) this.stmtL0FtsDelete.run(locator);
+    }
+  }
+
+  /** Write the vector for a committed locator when the caller supplied one. */
+  private writeVersionVec(
+    layer: "l0" | "l1",
+    locator: string,
+    embedding: Float32Array | undefined,
+    timestamp: string,
+  ): void {
+    if (!embedding || embedding.every((v) => v === 0) || !this.vecTablesReady) return;
+    if (layer === "l1") {
+      this.stmtDeleteVec!.run(locator);
+      this.stmtInsertVec!.run(locator, Buffer.from(embedding.buffer), timestamp);
+    } else {
+      this.stmtL0DeleteVec!.run(locator);
+      this.stmtL0InsertVec!.run(locator, Buffer.from(embedding.buffer), timestamp);
+    }
+  }
+
+  private parseSourceMessageIds(raw: unknown): string[] {
+    if (Array.isArray(raw)) return raw.filter((v): v is string => typeof v === "string");
+    if (typeof raw !== "string" || !raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+    } catch {
       return [];
     }
   }
@@ -1735,6 +2584,7 @@ export class VectorStore implements IMemoryStore {
 
       this.db.exec("BEGIN");
       try {
+        this.assertHistoryWriteOwner("l0", record.id, this.l0ScopeFor(record));
         // Legacy callers may omit isolation fields; normalize them to the
         // same default identity used by schema defaults and query filters.
         this.stmtL0UpsertMeta.run(
@@ -1744,6 +2594,7 @@ export class VectorStore implements IMemoryStore {
           (record as L0Record & { teamId?: string }).teamId || DEFAULT_ISOLATION_ID,
           record.taskId || "",
           record.role,
+          record.source ?? "conversation",
           record.messageText,
           record.recordedAt,
           record.timestamp,
@@ -1787,6 +2638,18 @@ export class VectorStore implements IMemoryStore {
               `${TAG} [L0-upsert] FTS write failed (non-fatal) id=${record.id}: ${ftsErr instanceof Error ? ftsErr.message : String(ftsErr)}`,
             );
           }
+        }
+
+        // Content history: current L0 row + version commit together.
+        if (this.contentHistory) {
+          this.contentHistory.recordStoreWrite({
+            layer: "l0",
+            locator: record.id,
+            scope: this.l0ScopeFor(record),
+            body: record.messageText,
+            metadata: this.l0HistoryMetadata(record),
+            state: "active",
+          });
         }
 
         this.db.exec("COMMIT");
@@ -1964,6 +2827,7 @@ export class VectorStore implements IMemoryStore {
    * **Fault-tolerant**: logs a warning on failure, never throws.
    */
   deleteL0(recordId: string, filter?: IsolationFilter): boolean {
+    if (this.contentHistoryEnabled) throw new HistoryDeleteUndefinedError("deleteL0");
     if (this.degraded) return false;
     try {
       if (filter) {
@@ -2001,6 +2865,7 @@ export class VectorStore implements IMemoryStore {
    * in a single transaction to guarantee consistency.
    */
   deleteL0Expired(cutoffIso: string): number {
+    if (this.contentHistoryEnabled) throw new HistoryDeleteUndefinedError("deleteL0Expired");
     if (this.degraded) {
       this.logger?.warn(`${TAG} [deleteExpiredL0] SKIPPED (degraded mode)`);
       return 0;
@@ -2290,6 +3155,23 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /** Read one L0 record by primary key with identity filtering (absent/out-of-scope → null). */
+  getL0RecordById(recordId: string, filter?: IsolationFilter): L0QueryRow | null {
+    if (this.degraded) return null;
+    try {
+      const row = this.db.prepare(`
+        SELECT record_id, session_key, session_id, team_id, task_id, user_id, agent_id,
+               role, message_text, recorded_at, timestamp
+        FROM l0_conversations WHERE record_id = ?
+      `).get(recordId) as unknown as L0QueryRow | undefined;
+      if (!row) return null;
+      if (!rowMatchesIsolation(row, filter)) return null;
+      return row;
+    } catch (err) {
+      throw new Error(`L0 content read failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /**
    * Query L0 messages for a given session key, grouped by session_id.
    * Each group's messages are in chronological order (recorded_at ASC).
@@ -2523,7 +3405,7 @@ export class VectorStore implements IMemoryStore {
 
       // Fetch page — must include user_id / agent_id so callers can enforce
       // isolation in downstream filters / Coordinator candidate pool.
-      const dataSql = `SELECT record_id, content, type, priority, scene_name, session_key, session_id, team_id, task_id, user_id, agent_id, version, timestamp_str, timestamp_start, timestamp_end, created_time, updated_time, metadata_json FROM l1_records ${where} ORDER BY updated_time DESC LIMIT ? OFFSET ?`;
+      const dataSql = `SELECT record_id, content, type, priority, scene_name, session_key, session_id, team_id, task_id, user_id, agent_id, version, timestamp_str, timestamp_start, timestamp_end, created_time, updated_time, metadata_json, source_message_ids_json FROM l1_records ${where} ORDER BY updated_time DESC LIMIT ? OFFSET ?`;
       const rows = this.db.prepare(dataSql).all(...params, filter.limit, filter.offset) as unknown as L1RecordRow[];
 
       return { rows, total };
@@ -2538,6 +3420,7 @@ export class VectorStore implements IMemoryStore {
    * Returns the count of actually deleted rows.
    */
   deleteL0BySession(sessionId: string, filter?: IsolationFilter): number {
+    if (this.contentHistoryEnabled) throw new HistoryDeleteUndefinedError("deleteL0BySession");
     // 空 sessionId 会匹配所有 session_key/session_id 为空的历史 legacy 行，
     // 造成远超预期的删除范围。空 session 不是有效删除目标，直接拒绝。
     const sessionIdTrimmed = (sessionId ?? "").trim();
@@ -2595,6 +3478,7 @@ export class VectorStore implements IMemoryStore {
    * 所以 profilesDeleted 恒为 0，L2/L3 文件由调用方走 StorageAdapter 清理。
    */
   clearMemoryContent(filter: MemoryContentClearFilter): MemoryContentClearResult {
+    if (this.contentHistoryEnabled) throw new HistoryDeleteUndefinedError("clearMemoryContent");
     const teamId = (filter?.teamId ?? "").trim();
     const agentId = (filter?.agentId ?? "").trim();
     if (!teamId || !agentId) {

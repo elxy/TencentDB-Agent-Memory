@@ -49,13 +49,13 @@ export async function queryMemoryRecords(
   }
 
   const rows = await vectorStore.queryL1Records(filter);
-  return rows.map(rowToMemoryRecord);
+  return rows.map((row) => rowToMemoryRecord(row, logger));
 }
 
 /**
  * Convert a raw SQLite L1RecordRow to a MemoryRecord (same shape as JSONL records).
  */
-function rowToMemoryRecord(row: L1RecordRow): MemoryRecord {
+function rowToMemoryRecord(row: L1RecordRow, logger?: Logger): MemoryRecord {
   let metadata: EpisodicMetadata | Record<string, never> = {};
   try {
     metadata = JSON.parse(row.metadata_json) as EpisodicMetadata | Record<string, never>;
@@ -77,7 +77,11 @@ function rowToMemoryRecord(row: L1RecordRow): MemoryRecord {
     type: row.type as MemoryType,
     priority: row.priority,
     scene_name: row.scene_name,
-    source_message_ids: [], // not stored in SQLite (vector search doesn't need them)
+    // Persisted model-declared citations (filtered against the input batch at
+    // extraction time). Empty for legacy rows — treated as unknown, not as
+    // "no evidence". A malformed column is logged and reported as unknown
+    // rather than silently coerced to "no sources".
+    source_message_ids: parseSourceMessageIds(row.source_message_ids_json, row.record_id, logger),
     metadata,
     timestamps,
     createdAt: row.created_time,
@@ -244,4 +248,27 @@ export async function readAllMemoryRecords(
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
+}
+
+/**
+ * Parse a persisted `source_message_ids_json` value into a string array.
+ *
+ * Malformed / non-array values are NOT silently swallowed: they are logged and
+ * returned as `[]` (which the API maps to `unknown`). Callers can thus tell a
+ * corrupt column apart from a genuinely empty citation set in the logs.
+ */
+function parseSourceMessageIds(raw: unknown, recordId?: string, logger?: Logger): string[] {
+  if (Array.isArray(raw)) return raw.filter((v): v is string => typeof v === "string");
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      logger?.warn?.(`${TAG} source_message_ids for ${recordId ?? "?"} is not an array (treated as unknown)`);
+      return [];
+    }
+    return parsed.filter((v): v is string => typeof v === "string");
+  } catch {
+    logger?.warn?.(`${TAG} source_message_ids for ${recordId ?? "?"} is malformed JSON (treated as unknown)`);
+    return [];
+  }
 }

@@ -28,6 +28,7 @@ import type { ProfileIsolation } from "../profile/profile-scope.js";
 import type { SceneIndexEntry } from "../scene/scene-index.js";
 import { classifyPath } from "./profile-row-backend.js";
 import {
+  L3_DOCUMENTS,
   StoragePaths,
   type IStorageBackend,
   type ListObjectsOptions,
@@ -163,7 +164,7 @@ export class CompositeStorageBackend implements IStorageBackend {
 
   /**
    * A prefix selects the profile space when it reaches into `scene_blocks/`
-   * or names `persona.md` — including partial spellings of those two (a list
+   * or names one of the L3 documents — including partial spellings (a list
    * of "scene_bl" must still see rows). Such a partial spelling can shadow
    * same-spelled others-leg keys; accepted, because real callers always list a
    * concrete directory. The empty prefix selects the others leg only.
@@ -172,7 +173,8 @@ export class CompositeStorageBackend implements IStorageBackend {
     if (!prefix) return this.othersBackend;
     const dir = StoragePaths.sceneBlocksDir;
     const hitsProfile =
-      prefix.startsWith(dir) || dir.startsWith(prefix) || StoragePaths.persona.startsWith(prefix);
+      prefix.startsWith(dir) || dir.startsWith(prefix)
+      || L3_DOCUMENTS.some((doc) => doc.startsWith(prefix));
     const backend = hitsProfile ? this.profile : this.othersBackend;
     this.logger?.debug?.(`${TAG} route ${backend.type}: prefix ${prefix}`);
     return backend;

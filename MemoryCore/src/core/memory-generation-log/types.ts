@@ -16,6 +16,37 @@ export interface MemoryGenerationPromptRef {
   prompt_sha256: string;
 }
 
+/**
+ * The additive custom strategy actually composed onto the base system prompt.
+ * Present only when an agent/team/instance memory prompt was applied.
+ */
+export interface MemoryGenerationSystemPromptStrategyRef {
+  memory_prompt_id: string;
+  version: number;
+  source: MemoryPromptSource;
+  prompt_sha256: string;
+}
+
+/**
+ * Diagnostic description of the real system prompt handed to the model for one
+ * generation. This is deliberately separate from {@link MemoryGenerationPromptRef}:
+ * that field tracks the additive memory-prompt strategy (and stays `builtin` with
+ * an empty hash when no strategy is configured), whereas this ref records the
+ * effective prompt and its provenance without overloading the legacy enum.
+ *
+ * Optional on the log so pre-existing `schema_version: 1` logs stay readable.
+ */
+export interface MemoryGenerationSystemPromptRef {
+  /** SHA-256 of the exact effective systemPrompt passed to the model. */
+  effective_sha256: string;
+  /** Where the base prompt came from (before the additive strategy). */
+  base_source: "builtin" | "operator_template";
+  /** SHA-256 of the base prompt (builtin default, or operator override + mandatory contract). */
+  base_sha256: string;
+  /** Additive strategy overlay, when one was actually composed. */
+  strategy?: MemoryGenerationSystemPromptStrategyRef;
+}
+
 export interface MemoryGenerationLog {
   schema_version: 1;
   log_id: string;
@@ -29,6 +60,8 @@ export interface MemoryGenerationLog {
   session_id?: string;
   task_id?: string;
   prompt: MemoryGenerationPromptRef;
+  /** Optional; absent on logs written before this field existed. */
+  system_prompt?: MemoryGenerationSystemPromptRef;
   anchor_memory_id?: string;
   input_refs: MemoryGenerationRef[];
   output_refs: MemoryGenerationRef[];

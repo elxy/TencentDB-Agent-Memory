@@ -17,8 +17,8 @@
  * Note: writing an empty/whitespace-only string is rejected by the core write tool's
  * parameter validation, so we use a non-empty marker instead.
  *
- * Persona update requests are communicated via text output signals (out-of-band),
- * parsed by the engineering side after LLM execution completes.
+ * 2026-10-12 收窄：L2 只整理、不裁决——遇到矛盾在专题中写明分歧，不判断对错，
+ * 由主 Agent 裁决；不再有 PERSONA_UPDATE_REQUEST 信号（Core 不自动生成 L3）。
  */
 
 import type { MemoryPromptMode } from "../../config.js";
@@ -173,7 +173,7 @@ function buildSceneSystemPrompt(maxScenes: number): string {
 ### 阶段 3：撰写与合成（核心任务）
 深度整合: 严禁简单的文本追加。你必须结合上下文（基于摘要或提供的原始内容）重写叙事，将新信息自然地融入其中。
 隐性推断: 寻找用户 没说出口 的信息。更新"隐性信号"部分。
-冲突检测: 如果新记忆与旧记忆相矛盾，将其记录在"演变轨迹"或"待确认/矛盾点"中。
+冲突检测（只整理、不裁决）: 如果新记忆与旧记忆相矛盾，不要判断谁对谁错，也不要删除旧认识；把双方的分歧如实记录在"待确认/矛盾点"中，并保留各自的时间，由主 Agent 裁决。
 
 ### 撰写准则 (严格遵守)
 核心部分禁止列表: "用户核心特征"和"核心叙事"必须是连贯的段落，信息要连贯，可以分段。
@@ -235,17 +235,6 @@ heat: [Integer]
 
 \`\`\`
 
-
-
-#### 主动触发 Persona 更新（可选）
-
-**触发条件**：重大价值观转变、跨场景突破性洞察。
-
-**触发方式**：在你的 text output 中输出以下标记（不是文件操作）：
-
-[PERSONA_UPDATE_REQUEST]
-reason: 具体原因描述
-[/PERSONA_UPDATE_REQUEST]
 
 
 **执行文件操作**（必须使用工具）：
@@ -427,7 +416,7 @@ function buildWorkSceneSystemPrompt(maxScenes: number): string {
 
 事实和状态只用于说明方法的来源和适用条件，不要堆砌历史细节。
 
-冲突检测：如果新记忆与旧记忆相矛盾，将其记录在"演化记录"或"待确认问题"中，不要直接覆盖。
+冲突检测（只整理、不裁决）：如果新记忆与旧记忆相矛盾，不要判断谁对谁错，也不要直接覆盖；把双方的分歧如实记录在"演化记录"或"待确认问题"中，并保留各自的时间，由主 Agent 裁决。
 
 ---
 
@@ -499,22 +488,6 @@ heat: [Integer]
 ## 待确认问题
 [可为空。记录影响 SOP、边界、判断标准或执行方式的未决问题。]
 \`\`\`
-
----
-
-## 主动触发 L3 Team Memory 更新（可选）
-
-**触发条件**：
-- 跨场景复用的 SOP、禁忌、原则或设计方法形成稳定共识。
-- 项目级工作规则升级为团队级规则。
-- 关键决策影响多个 Scene Block。
-- 某个工作方法、Agent 行为规则或协作约定应沉淀到 L3 Team Operating Memory。
-
-**触发方式**：在你的 text output 中输出以下标记（不是文件操作）：
-
-[PERSONA_UPDATE_REQUEST]
-reason: 具体原因描述
-[/PERSONA_UPDATE_REQUEST]
 
 ---
 

@@ -4,6 +4,7 @@ import path from "node:path";
 import type { IMemoryStore, ProfileRecord, ProfileSyncRecord } from "../store/types.js";
 import { readSceneIndex, syncSceneIndex } from "../scene/scene-index.js";
 import { generateSceneNavigation, stripSceneNavigation } from "../scene/scene-navigation.js";
+import { validateSceneBlock, isSoftDeletedScene } from "../scene/scene-format.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { StoragePaths } from "../storage/types.js";
 import type { Logger } from "../types.js";
@@ -432,6 +433,29 @@ export async function syncLocalProfilesToStore(
     return [];
   }
   const localProfiles = await listLocalProfiles(dataDir, storage, options);
+
+  // Strict format gate: never upload a malformed L2 scene block into the store.
+  // Runs BEFORE any store.syncProfiles()/deleteProfiles() call so an invalid
+  // file cannot enter (or corrupt) the DB. Validation lives here rather than
+  // inside listLocalProfiles() so its broad try/catch cannot swallow it.
+  const invalidL2: string[] = [];
+  for (const profile of localProfiles) {
+    if (profile.type !== "l2") continue;
+    if (isSoftDeletedScene(profile.content)) {
+      invalidL2.push(`${profile.filename}: soft-deleted marker is not a valid scene`);
+      continue;
+    }
+    const result = validateSceneBlock(profile.content, profile.filename);
+    if (!result.valid) {
+      invalidL2.push(`${profile.filename}: ${result.error ?? "invalid scene format"}`);
+    }
+  }
+  if (invalidL2.length > 0) {
+    throw new Error(
+      `[memory-tdai][profile-sync] refusing to sync ${invalidL2.length} malformed L2 scene block(s): ${invalidL2.join("; ")}`,
+    );
+  }
+
   const localIds = new Set(localProfiles.map((profile) => profile.id));
 
   const syncRecords: ProfileSyncRecord[] = localProfiles
@@ -441,9 +465,13 @@ export async function syncLocalProfilesToStore(
       baselineVersion: baselineMap.get(profile.id)?.version,
     }));
 
-  if (syncRecords.length > 0 && store.syncProfiles) {
-    await store.syncProfiles(syncRecords);
-    logger.info(`[memory-tdai][profile-sync] Synced ${syncRecords.length} changed profile(s)`);
+  if (syncRecords.length > 0) {
+    if (store.syncProfiles) {
+      await store.syncProfiles(syncRecords);
+      logger.info(`[memory-tdai][profile-sync] Synced ${syncRecords.length} changed profile(s)`);
+    } else {
+      logger.warn(`[memory-tdai][profile-sync] Store has no profile sync capability; ${syncRecords.length} changed profile(s) remain file-backed, not written to DB`);
+    }
   }
 
   const deletedIds = [...baselineMap.keys()].filter((id) => !localIds.has(id));

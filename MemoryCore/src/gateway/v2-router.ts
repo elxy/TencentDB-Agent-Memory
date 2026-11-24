@@ -17,9 +17,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import type http from "node:http";
 import { classifyError } from "./error-handler.js";
-import type { IMemoryStore, L0Record, ProfileSyncRecord } from "../core/store/types.js";
+import type { IMemoryStore, L0Record, L1RecordRow, ProfileSyncRecord, CommittedOperationRecord } from "../core/store/types.js";
+import { DEFAULT_ISOLATION_ID } from "../core/store/types.js";
+import { buildL0VersionMetadata, PROGRAM_REQUEST_METADATA_KEY } from "../core/store/sqlite/content-history.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
+import { openPublishedSnapshotOf } from "../core/storage/local-published-storage.js";
 import { StoragePaths } from "../core/storage/types.js";
 import type { Logger } from "../core/types.js";
 import type { IStateBackend } from "../core/state/types.js";
@@ -36,16 +39,19 @@ import {
   conversationSearchRequestSchema,
   conversationDeleteRequestSchema,
   conversationCountRequestSchema,
+  conversationGetRequestSchema,
   atomicUpdateRequestSchema,
   atomicQueryRequestSchema,
   atomicSearchRequestSchema,
   atomicDeleteRequestSchema,
   atomicCountRequestSchema,
+  atomicGetRequestSchema,
   scenarioListRequestSchema,
   scenarioReadRequestSchema,
   scenarioWriteRequestSchema,
   scenarioRmRequestSchema,
   scenarioCountRequestSchema,
+  coreReadRequestSchema,
   coreWriteRequestSchema,
   coreCountRequestSchema,
   teamCreateRequestSchema,
@@ -74,6 +80,7 @@ import {
   type ConversationQueryData,
   type ConversationSearchData,
   type ConversationDeleteData,
+  type ConversationGetData,
   type CountData,
   type AtomicDetail,
   type AtomicUpdateData,
@@ -81,6 +88,8 @@ import {
   type AtomicSearchData,
   type AtomicSearchHit,
   type AtomicDeleteData,
+  type AtomicGetData,
+  type AtomicSourceView,
   type ScenarioEntry,
   type ScenarioFile,
   type ScenarioWriteData,
@@ -94,6 +103,21 @@ import {
 } from "./v2-schemas.js";
 import { stripSceneNavigation } from "../core/scene/scene-navigation.js";
 import { buildProfileIsolationScope, buildProfileStableId, DEFAULT_PROFILE_SCOPE } from "../core/profile/profile-scope.js";
+import { readContentSourceViewForContent, removeContentSources } from "../core/content/sources.js";
+import { unknownContentSource } from "../core/content/types.js";
+import type { ContentVersion, HistoryScope, VersionMutation } from "../core/content/history-contract.js";
+import {
+  contentSourceViewFromVersion,
+  contentVersionView,
+  handleContentChanges,
+  handleContentHistory,
+  handleContentRead,
+  resolveLocalLocatorHistory,
+  resolveStoreRecordHistory,
+  resolveStoreRecordHistoryByLocator,
+} from "./content-history-handlers.js";
+import { handleContentWrite } from "./content-write-handlers.js";
+import { buildContentHistoryAuthFilter, readVersionAsync } from "../core/content/history-reader.js";
 
 const TAG = "[tdai-gateway][v2]";
 const V2_PREFIX = "/v2";
@@ -153,11 +177,13 @@ function collectV3Missing(
 const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/conversation/add",
   "/conversation/query",
+  "/conversation/get",
   "/conversation/search",
   "/conversation/delete",
   "/conversation/count",
   "/atomic/update",
   "/atomic/query",
+  "/atomic/get",
   "/atomic/search",
   "/atomic/delete",
   "/atomic/count",
@@ -169,6 +195,10 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/core/read",
   "/core/write",
   "/core/count",
+  "/content/read",
+  "/content/history",
+  "/content/changes",
+  "/content/write",
 ]);
 
 /**
@@ -413,11 +443,13 @@ type RouteHandler = (
 const DATAPLANE_HANDLERS: Record<string, RouteHandler> = {
   "/conversation/add": handleConversationAdd,
   "/conversation/query": handleConversationQuery,
+  "/conversation/get": handleConversationGet,
   "/conversation/search": handleConversationSearch,
   "/conversation/delete": handleConversationDelete,
   "/conversation/count": handleConversationCount,
   "/atomic/update": handleAtomicUpdate,
   "/atomic/query": handleAtomicQuery,
+  "/atomic/get": handleAtomicGet,
   "/atomic/search": handleAtomicSearch,
   "/atomic/delete": handleAtomicDelete,
   "/atomic/count": handleAtomicCount,
@@ -429,6 +461,10 @@ const DATAPLANE_HANDLERS: Record<string, RouteHandler> = {
   "/core/read": handleCoreRead,
   "/core/write": handleCoreWrite,
   "/core/count": handleCoreCount,
+  "/content/read": handleContentRead,
+  "/content/history": handleContentHistory,
+  "/content/changes": handleContentChanges,
+  "/content/write": handleContentWrite,
 };
 
 const routeTable: Record<string, RouteHandler> = {
@@ -517,7 +553,7 @@ export async function handleV2Route(
   );
   if (!isV2 && !isV3) return false;
 
-  // /v3 暴露 L0–L3 数据面 14 条（V3_ALLOWED_SUBPATHS）+ /v3/skill/* + /v3/knowledge/*（extraRouteTable）；
+  // /v3 暴露 L0–L3 数据面 15 条（V3_ALLOWED_SUBPATHS）+ /v3/skill/* + /v3/knowledge/*（extraRouteTable）；
   // 其他 /v3 子路径直接走 404
   if (isV3 && !isV3Extra) {
     const sub = pathname.slice(V3_PREFIX.length);
@@ -711,58 +747,171 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   }
 
   const embedding = deps.getEmbedding();
+  const historyMode = storeContentHistoryEnabled(store);
   const acceptedIds: string[] = [];
+  // Only NEWLY appended records — a duplicate replay never re-dispatches or
+  // re-mirrors an already-processed message.
   const acceptedRecords: L0Record[] = [];
-  const ingestBaseMs = Date.now();
+  const duplicateIds: string[] = [];
 
-  for (const [index, msg] of messages.entries()) {
-    // Full UUID (hyphens stripped, 32 hex) — do NOT truncate. At ~1e8 messages
-    // a 12-hex (48-bit) id collides ~18 times by the birthday bound, and an
-    // upsert-based write would silently overwrite the colliding message.
-    const id = `msg-${randomUUID().replace(/-/g, "")}`;
-    const ingestRecordedAtMs = ingestBaseMs + index;
-    const recordedAtMs = msg.recorded_at
-      ? new Date(msg.recorded_at).getTime()
-      : ingestRecordedAtMs;
-    const record: L0Record = {
-      id,
-      sessionKey: session_id,
-      sessionId: session_id,
-      taskId: iso?.taskId,
-      // Tenancy isolation: resolveIsolation() defaults missing fields to the default bucket.
-      teamId: iso?.teamId,
-      userId: iso?.userId,
-      agentId: iso?.agentId,
-      role: msg.role,
-      messageText: msg.content,
-      recordedAt: new Date(recordedAtMs).toISOString(),
-      timestamp: msg.timestamp ? new Date(msg.timestamp).getTime() : recordedAtMs,
-    };
-    acceptedIds.push(id);
-    acceptedRecords.push(record);
-  }
-
-  // Write path. One `/conversation/add` is one group of messages, so prefer a
-  // single batch insert when the store supports it AND no per-message embedding
-  // is required (keyword-only backends, e.g. Mongo). Otherwise fall back to the
-  // per-record upsert loop (sqlite/tcvdb, incl. vector embedding).
-  if (store.insertL0Batch && !embedding) {
-    await store.insertL0Batch(acceptedRecords);
-  } else {
-    for (const record of acceptedRecords) {
-      let emb: Float32Array | undefined;
-      if (embedding) {
-        try { emb = await embedding.embed(record.messageText); } catch (e) { console.warn(`[v2-router] L0 embedding failed:`, e); }
+  if (historyMode) {
+    // History mode: an append is a `create` L0 content commit, committed through
+    // the store's OWN transaction (never a check-then-raw-upsert race). The
+    // store's locator conflict / operation de-duplication decides the outcome,
+    // and a stable operation id derived from the message id makes a repeat
+    // idempotent. A retired message id is never revived.
+    if (typeof store.commitContentChanges !== "function") {
+      return errorEnvelope(501, "history_unavailable: this store has no formal content commit entry", requestId);
+    }
+    const seenIds = new Set<string>();
+    for (const msg of messages) {
+      if (!msg.id) {
+        return errorEnvelope(
+          400,
+          "history_message_id_required: content history is enabled, so every appended message must carry a stable `id`" +
+            " (a random id would create an uncontrolled duplicate version). Use `id` (and, optionally, `operation_id`).",
+          requestId,
+        );
       }
-      await store.upsertL0(record, emb);
+      const id = msg.id;
+      if (seenIds.has(id)) {
+        return errorEnvelope(
+          409,
+          `history_message_conflict: message ${id} is declared more than once in one request`,
+          requestId,
+        );
+      }
+      seenIds.add(id);
+    }
+    // Validate the complete request before its first durable append.
+    for (const msg of messages) {
+      const id = msg.id!;
+      const scope = l0AppendScope(session_id, iso);
+      const operationId = msg.operation_id ?? `conversation/add:${id}`;
+      const fingerprint = fingerprintL0Append(id, msg, session_id, iso);
+      const mutation = buildL0AppendMutation(id, msg, session_id, iso);
+      mutation.draft.metadata = { ...(mutation.draft.metadata ?? {}), [PROGRAM_REQUEST_METADATA_KEY]: fingerprint };
+
+      // A committed append with the SAME request semantics is a duplicate; a
+      // different payload under the same stable id is a conflict.
+      const committed = await lookupL0CommittedOperation(store, scope, operationId);
+      if (committed) {
+        if (committed.request_fingerprint !== fingerprint) {
+          return errorEnvelope(
+            409,
+            `history_message_conflict: message ${id} already exists with different content; ` +
+              `use content/write with operation_id + expected_version_id to revise it`,
+            requestId,
+          );
+        }
+        duplicateIds.push(id);
+        acceptedIds.push(id);
+        continue;
+      }
+
+      const filter = {
+        teamId: iso?.teamId,
+        userId: iso?.userId,
+        agentId: iso?.agentId,
+        taskId: iso?.taskId,
+        sessionId: session_id,
+      };
+      let result;
+      try {
+        result = await store.commitContentChanges(
+          { operation_id: operationId, actor: "user", mutations: [mutation] },
+          filter,
+        );
+      } catch (err) {
+        const code = (err as { code?: unknown } | null)?.code;
+        if (
+          code === "history_operation_conflict" || code === "history_locator_conflict" ||
+          code === "content_id_exists" || code === "history_retired_conflict"
+        ) {
+          // A concurrent/losing writer may have committed the SAME request: only
+          // an identical fingerprint is a duplicate; anything else stays 409.
+          const retry = await lookupL0CommittedOperation(store, scope, operationId);
+          if (retry && retry.request_fingerprint === fingerprint) {
+            duplicateIds.push(id);
+            acceptedIds.push(id);
+            continue;
+          }
+          return errorEnvelope(
+            409,
+            `history_message_conflict: message ${id} already exists with different content; ` +
+              `use content/write with operation_id + expected_version_id to revise it`,
+            requestId,
+          );
+        }
+        return errorEnvelope(
+          historyWriteStatus(code),
+          `history_message_write_failed: ${err instanceof Error ? err.message : String(err)}`,
+          requestId,
+        );
+      }
+      const version = result.versions[0];
+      if (!version) {
+        return errorEnvelope(503, `L0 write not confirmed for message ${id}`, requestId);
+      }
+      acceptedIds.push(id);
+      acceptedRecords.push(l0AppendRecord(version, msg));
+    }
+  } else {
+    // Legacy (history off): unchanged — random ids, optional batch insert. The
+    // upsert return value is CHECKED: an unconfirmed write must not be reported
+    // as accepted.
+    const ingestBaseMs = Date.now();
+    for (const [index, msg] of messages.entries()) {
+      // Full UUID (hyphens stripped, 32 hex) — do NOT truncate. At ~1e8 messages
+      // a 12-hex (48-bit) id collides ~18 times by the birthday bound.
+      const id = msg.id ?? `msg-${randomUUID().replace(/-/g, "")}`;
+      const ingestRecordedAtMs = ingestBaseMs + index;
+      const recordedAtMs = msg.recorded_at
+        ? new Date(msg.recorded_at).getTime()
+        : ingestRecordedAtMs;
+      const record: L0Record = {
+        id,
+        sessionKey: session_id,
+        sessionId: session_id,
+        taskId: iso?.taskId,
+        // Tenancy isolation: resolveIsolation() defaults missing fields to the default bucket.
+        teamId: iso?.teamId,
+        userId: iso?.userId,
+        agentId: iso?.agentId,
+        role: msg.role,
+        source: msg.source === "framework_event" ? "framework_event" : "conversation",
+        messageText: msg.content,
+        recordedAt: new Date(recordedAtMs).toISOString(),
+        timestamp: msg.timestamp ? new Date(msg.timestamp).getTime() : recordedAtMs,
+      };
+      acceptedIds.push(id);
+      acceptedRecords.push(record);
+    }
+    if (acceptedRecords.length > 0) {
+      if (store.insertL0Batch && !embedding) {
+        await store.insertL0Batch(acceptedRecords);
+      } else {
+        for (const record of acceptedRecords) {
+          let emb: Float32Array | undefined;
+          if (embedding) {
+            try { emb = await embedding.embed(record.messageText); } catch (e) { console.warn(`[v2-router] L0 embedding failed:`, e); }
+          }
+          const written = await store.upsertL0(record, emb);
+          if (written === false) {
+            return errorEnvelope(503, `L0 write not confirmed for message ${record.id}`, requestId);
+          }
+        }
+      }
     }
   }
 
   // Notify pipeline: trigger async L1 extraction (service mode).
   // Each role=user message counts as one conversation round for threshold/timer logic.
   // teamId/agentId 透传给 captureAtomic 决定 hash slot 与锁粒度。
-  if (deps.notifyPipeline) {
-    const rounds = messages.filter((m) => m.role === "user").length;
+  // Only NEWLY appended messages count — a duplicate replay of an already
+  // persisted message must not re-dispatch an already-processed operation.
+  if (deps.notifyPipeline && acceptedRecords.length > 0) {
+    const rounds = acceptedRecords.filter((r) => r.role === "user").length;
     if (rounds > 0) {
       try {
         await deps.notifyPipeline(auth.serviceId, session_id, rounds, iso?.teamId, iso?.agentId);
@@ -816,7 +965,13 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   }
 
   return successEnvelope<ConversationAddData>(
-    { accepted_ids: acceptedIds, accepted_versions: acceptedIds.map(() => "v1"), total_count: acceptedIds.length },
+    {
+      accepted_ids: acceptedIds,
+      accepted_versions: acceptedIds.map(() => "v1"),
+      total_count: acceptedIds.length,
+      appended: acceptedRecords.length,
+      duplicates: duplicateIds.length,
+    },
     requestId,
   );
 }
@@ -890,6 +1045,80 @@ async function handleConversationQuery(body: unknown, _auth: V2AuthContext, requ
   }));
 
   return successEnvelope<ConversationQueryData>({ messages, total }, requestId);
+}
+
+/**
+ * `/conversation/get` — read one L0 message by id.
+ *
+ * Identity is enforced at the store query; an absent id and an id owned by
+ * another scope both return 404, so the endpoint never reveals cross-scope
+ * existence. `version` (the legacy numeric field) is rejected explicitly
+ * rather than silently ignored.
+ *
+ * When content history is enabled the message carries a unified `ref`, and an
+ * explicit `version_id` reads that exact historical version. An unknown version
+ * is an explicit miss — it never falls back to the current message.
+ */
+async function handleConversationGet(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  const parsed = conversationGetRequestSchema.safeParse(body);
+  if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
+  if (parsed.data.version !== undefined) {
+    return errorEnvelope(400, "unsupported_version: historical L0 reads are not implemented; omit version", requestId);
+  }
+
+  const store = deps.getStore();
+  if (!store) return errorEnvelope(503, "Store not available", requestId);
+  if (typeof store.getL0RecordById !== "function") {
+    return errorEnvelope(501, "unsupported: this store does not support L0 read by id", requestId);
+  }
+
+  const filter = buildContentIsolationFilter(deps.requestIsolation);
+  const row = await store.getL0RecordById(parsed.data.id, filter);
+
+  // A retired L0 message has no live row, but its immutable version is still
+  // reachable by its old record id — resolved behind the trusted authorization
+  // filter, so a caller never supplies a scope and existence is not leaked.
+  if (!row && parsed.data.version_id !== undefined) {
+    const retired = await resolveStoreRecordHistoryByLocator(deps, "l0", parsed.data.id, parsed.data.version_id);
+    if (!retired.ok) return errorEnvelope(retired.failure.status, retired.failure.message, requestId);
+    if (retired.version) {
+      const fallback = {
+        id: retired.version.locator,
+        role: "user",
+        content: retired.version.body,
+        timestamp: retired.version.recorded_at,
+      } as unknown as ConversationItem;
+      return successEnvelope<ConversationGetData>({
+        message: conversationItemFromVersion(retired.version, fallback),
+        ref: retired.version.ref,
+        content_version: contentVersionView(retired.version),
+      }, requestId);
+    }
+  }
+
+  if (!row) return errorEnvelope(404, `Conversation message not found: ${parsed.data.id}`, requestId);
+
+  const currentMessage: ConversationItem = {
+    id: row.record_id,
+    session_id: row.session_id,
+    team_id: row.team_id,
+    user_id: row.user_id,
+    agent_id: row.agent_id,
+    task_id: row.task_id,
+    role: row.role as ConversationItem["role"],
+    content: row.message_text,
+    timestamp: row.recorded_at,
+  };
+
+  const history = await resolveStoreRecordHistory(deps, "l0", row.record_id, row, parsed.data.version_id);
+  if (!history.ok) return errorEnvelope(history.failure.status, history.failure.message, requestId);
+
+  const data: ConversationGetData = {
+    message: history.version ? conversationItemFromVersion(history.version, currentMessage) : currentMessage,
+  };
+  if (history.ref) data.ref = history.ref;
+  if (history.version) data.content_version = contentVersionView(history.version);
+  return successEnvelope<ConversationGetData>(data, requestId);
 }
 
 async function handleConversationCount(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1006,6 +1235,10 @@ async function handleConversationDelete(body: unknown, auth: V2AuthContext, requ
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
 
+  // History mode refuses a destructive L0 delete; retire via content/write instead.
+  const historyForbidden = historyModeDeleteForbidden(store, requestId, "conversation/delete");
+  if (historyForbidden) return historyForbidden;
+
   // 删除的作用域是 (team, user, agent)，**不含 session**。
   // /v3 严格 isolation 要求请求头带 session_id，但删除语义是"删指定的
   // message / session"，若把 requestIsolation.sessionId 也塞进 filter，
@@ -1061,26 +1294,57 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
 
-  // Read existing record by primary key
-  const existing = await store.queryL1Records({ recordIds: [id] });
-  if (!existing || existing.length === 0) {
+  // History mode: an L1 modification without an expected_version_id / operation_id
+  // cannot be CAS-checked, so it is refused instead of silently revising.
+  const historyForbidden = historyModeStoreWriteForbidden(store, requestId, "atomic/update");
+  if (historyForbidden) return historyForbidden;
+
+  const iso = deps.requestIsolation;
+  // Scope the read itself: an id owned by another team/user/agent/task is
+  // indistinguishable from a missing one (existence never leaks). The model
+  // cannot widen this by putting anything in metadata.
+  //
+  // Use the exact by-id read: `queryL1Records({ recordIds })` is NOT guaranteed
+  // to filter by id (SQLite ignores recordIds), so relying on it could mutate
+  // the wrong row. Fall back to an exact match only when the store lacks the
+  // single-read capability.
+  const scopeFilter = buildContentIsolationFilter(iso);
+  let record: L1RecordRow | null;
+  if (typeof store.getL1RecordById === "function") {
+    record = await store.getL1RecordById(id, scopeFilter);
+  } else {
+    const rows = await store.queryL1Records({ ...(scopeFilter ?? {}) });
+    record = rows.find((row) => row.record_id === id) ?? null;
+  }
+  if (!record) {
     return errorEnvelope(404, `Atomic note not found: ${id}`, requestId);
   }
 
   const now = new Date().toISOString();
-  const record = existing[0];
 
-  // Build update: content is always overwritten; background (scene_name) only if provided.
-  // user_id / agent_id are preserved from the existing row — updates don't
-  // re-derive them. If the caller supplied an isolation triple that does NOT
-  // match the existing row, we treat it as a permission denial.
-  const iso = deps.requestIsolation;
+  // Defense in depth: even if a store ignores the query filter, re-check every
+  // supplied isolation dimension before mutating the row.
+  if (iso?.teamId && record.team_id && record.team_id !== iso.teamId) {
+    return errorEnvelope(403, `Atomic note ${id} belongs to a different team`, requestId);
+  }
   if (iso?.userId && record.user_id && record.user_id !== iso.userId) {
     return errorEnvelope(403, `Atomic note ${id} belongs to a different user`, requestId);
   }
   if (iso?.agentId && record.agent_id && record.agent_id !== iso.agentId) {
     return errorEnvelope(403, `Atomic note ${id} belongs to a different agent`, requestId);
   }
+  if (iso?.taskId && record.task_id && record.task_id !== iso.taskId) {
+    return errorEnvelope(403, `Atomic note ${id} belongs to a different task`, requestId);
+  }
+
+  // Sources describe the content bytes they were extracted from. If the content
+  // is unchanged, keep them; if it actually changed, the old declaration no
+  // longer describes the new bytes and must become unknown (never reused).
+  const contentUnchanged = record.content === content;
+  const preservedSourceIds = contentUnchanged
+    ? parseSourceMessageIdsJson(record.source_message_ids_json, record.record_id, deps.logger)
+    : [];
+
   const updatedVersion = (record.version ?? 0) + 1;
   const updated: MemoryRecord = {
     id,
@@ -1088,7 +1352,7 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
     type: record.type as any,
     priority: record.priority ?? 50,
     scene_name: background !== undefined ? background : (record.scene_name ?? ""),
-    source_message_ids: [],
+    source_message_ids: preservedSourceIds,
     metadata: parseMetadataJson(record.metadata_json),
     timestamps: record.timestamp_str ? [record.timestamp_str] : [],
     createdAt: record.created_time,
@@ -1106,7 +1370,7 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
   let emb: Float32Array | undefined;
   if (embedding) { try { emb = await embedding.embed(content); } catch (e) { console.warn(`[v2-router] L1 embedding failed:`, e); } }
 
-  await store.upsertL1(updated, emb);
+  if (!await store.upsertL1(updated, emb)) return errorEnvelope(503, "Atomic content update failed; result not confirmed", requestId);
 
   // 审计：L1 update — 用外部请求的 IdFields 而非 record 原值（per user 决策）
   await recordAudit(store, {
@@ -1119,7 +1383,12 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
     logger: deps.logger,
   });
 
-  return successEnvelope<AtomicUpdateData>({ id, version: `v${updatedVersion}`, updated_at: now }, requestId);
+  return successEnvelope<AtomicUpdateData>({
+    id,
+    version: `v${updatedVersion}`,
+    updated_at: now,
+    source: buildAtomicSourceView(preservedSourceIds),
+  }, requestId);
 }
 
 async function handleAtomicQuery(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1178,6 +1447,147 @@ async function handleAtomicQuery(body: unknown, _auth: V2AuthContext, requestId:
   }));
 
   return successEnvelope<AtomicQueryData>({ items, total }, requestId);
+}
+
+/**
+ * `/atomic/get` — read one L1 memory by id, including superseded versions.
+ *
+ * Live rows return `current: true`. Rows replaced by an update/merge are
+ * retained in the store's supersession archive and returned with
+ * `current: false` plus `superseded_by` when the replacement is known. Old
+ * (superseded) records are never returned by search/recall.
+ */
+async function handleAtomicGet(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  const parsed = atomicGetRequestSchema.safeParse(body);
+  if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
+  if (parsed.data.version !== undefined) {
+    return errorEnvelope(400, "unsupported_version: historical L1 reads are not implemented; omit version", requestId);
+  }
+
+  const store = deps.getStore();
+  if (!store) return errorEnvelope(503, "Store not available", requestId);
+  if (typeof store.getL1RecordById !== "function") {
+    return errorEnvelope(501, "unsupported: this store does not support L1 read by id", requestId);
+  }
+
+  const filter = buildContentIsolationFilter(deps.requestIsolation);
+  const current = await store.getL1RecordById(parsed.data.id, filter);
+  if (current) {
+    return finishAtomicGet(deps, requestId, {
+      item: {
+        id: current.record_id,
+        type: current.type,
+        content: current.content,
+        background: current.scene_name || undefined,
+        version: current.version ?? 0,
+        team_id: current.team_id,
+        user_id: current.user_id,
+        agent_id: current.agent_id,
+        task_id: current.task_id,
+        created_at: current.created_time,
+        updated_at: current.updated_time,
+        current: true,
+        source: buildAtomicSourceView(parseSourceMessageIdsJson(current.source_message_ids_json, current.record_id, deps.logger)),
+      },
+    }, current, parsed.data.version_id);
+  }
+
+  // Superseded (replaced) rows are only reachable when the store keeps the
+  // archive; a store without it returns an explicit 404, never a fabricated
+  // "current" result.
+  if (typeof store.getL1SupersededRecord === "function") {
+    const old = await store.getL1SupersededRecord(parsed.data.id, filter);
+    if (old) {
+      // Follow the full replacement chain: a single hop's `new_id` may itself
+      // have been superseded since. Callers must be able to reach the live id.
+      const successor = old.new_id || undefined;
+      let currentId: string | undefined;
+      const visited = new Set<string>([old.old_id]);
+      let cursor: typeof old | null = old;
+      while (cursor && cursor.new_id && !visited.has(cursor.new_id)) {
+        visited.add(cursor.new_id);
+        const live = await store.getL1RecordById!(cursor.new_id, filter);
+        if (live) {
+          currentId = live.record_id;
+          break;
+        }
+        cursor = await store.getL1SupersededRecord!(cursor.new_id, filter);
+      }
+
+      return finishAtomicGet(deps, requestId, {
+        item: {
+          id: old.old_id,
+          type: old.type,
+          content: old.content,
+          background: old.scene_name || undefined,
+          version: old.version ?? 0,
+          team_id: old.team_id,
+          user_id: old.user_id,
+          agent_id: old.agent_id,
+          task_id: old.task_id,
+          created_at: old.created_time,
+          updated_at: old.updated_time,
+          current: false,
+          ...(successor ? { superseded_by: successor, successor } : {}),
+          ...(currentId ? { current_id: currentId } : {}),
+          source: buildAtomicSourceView(old.source_message_ids),
+        },
+      }, old, parsed.data.version_id);
+    }
+  }
+
+  // A retired identity has no live row and is not in the supersession archive,
+  // but its immutable version is still reachable by its old record id (the
+  // locator mapping is kept). Resolve it behind the trusted authorization filter
+  // — the caller never supplies a scope, and existence is not leaked.
+  if (parsed.data.version_id !== undefined) {
+    const retired = await resolveStoreRecordHistoryByLocator(deps, "l1", parsed.data.id, parsed.data.version_id);
+    if (!retired.ok) return errorEnvelope(retired.failure.status, retired.failure.message, requestId);
+    if (retired.version) {
+      return successEnvelope<AtomicGetData>({
+        item: atomicItemFromVersion(retired.version, false),
+        content_version: contentVersionView(retired.version),
+      }, requestId);
+    }
+  }
+
+  return errorEnvelope(404, `Atomic note not found: ${parsed.data.id}`, requestId);
+}
+
+/**
+ * Attach the content-history reference to an L1 read (and, when an explicit
+ * `version_id` was requested, return that exact historical version instead of
+ * the current/archived row).
+ */
+async function finishAtomicGet(
+  deps: V2RouterDeps,
+  requestId: string,
+  result: AtomicGetData,
+  row: { team_id?: string; user_id?: string; agent_id?: string; task_id?: string },
+  versionId: string | undefined,
+): Promise<ApiResponseEnvelope> {
+  const item = result.item;
+  const history = await resolveStoreRecordHistory(deps, "l1", item.id, row, versionId);
+  if (!history.ok) return errorEnvelope(history.failure.status, history.failure.message, requestId);
+  let finalItem: AtomicGetData["item"] = item;
+  if (history.version) {
+    // One pinned version supplies body / type / background / source / ref, so a
+    // race between reading the current row and resolving the ref can never mix
+    // two commits into one response. An explicit `version_id` addresses a
+    // historical version, so it is never reported as the current row.
+    finalItem = {
+      ...item,
+      ...atomicItemFromVersion(history.version, versionId === undefined && item.current === true),
+      // The numeric legacy version only describes the live row; a historical
+      // read must not pass the current number off as the old version's number.
+      version: versionId !== undefined ? 0 : item.version,
+    };
+  } else if (history.ref) {
+    finalItem = { ...item, ref: history.ref };
+  }
+  const data: AtomicGetData = { item: finalItem };
+  if (history.version) data.content_version = contentVersionView(history.version);
+  return successEnvelope<AtomicGetData>(data, requestId);
 }
 
 async function handleAtomicCount(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1287,6 +1697,24 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
     created_at: r.created_at, updated_at: r.updated_at, score: r.score,
   }));
 
+  // 来源标注与撤回指针是读取方判断认识有效性的必要信息（design §5.3/§5.4）。
+  // 它们在版本元数据里（行内 metadata 按设计不含 canonical 键），按命中逐条
+  // 从 content history 补充；解析失败不虚构，留空即未标注。
+  const historyReader = deps.getStore()?.getContentHistory?.();
+  if (historyReader) {
+    const authFilter = buildContentHistoryAuthFilter(deps.requestIsolation);
+    for (const item of items) {
+      const resolved = historyReader.resolveLocatorAuthorized("l1", item.id, authFilter);
+      if (!resolved) continue;
+      const version = await readVersionAsync(historyReader, {
+        layer: "l1", content_id: resolved.ref.content_id, scope: resolved.scope,
+      });
+      const meta = version?.metadata as Record<string, unknown> | undefined;
+      if (typeof meta?.source === "string") item.l1_source = meta.source;
+      if (typeof meta?.withdraws === "string") item.withdraws = meta.withdraws;
+    }
+  }
+
   return successEnvelope<AtomicSearchData>({ items }, requestId);
 }
 
@@ -1297,6 +1725,10 @@ async function handleAtomicDelete(body: unknown, auth: V2AuthContext, requestId:
 
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
+
+  // History mode refuses a destructive L1 delete; retire via content/write instead.
+  const historyForbidden = historyModeDeleteForbidden(store, requestId, "atomic/delete");
+  if (historyForbidden) return historyForbidden;
 
   // deleteL1Batch returns bool, but we need actual count
   // Fall back to per-id deletion for accurate counting
@@ -1585,6 +2017,372 @@ function parseMetadataJson(raw: string | undefined): MemoryRecord["metadata"] {
   }
 }
 
+/**
+ * Isolation filter for content-by-id reads. Mirrors the query handlers: it
+ * narrows by team/user/agent/task but never by session, because a content id is
+ * globally addressed and L1 reads are agent-level. Absent/out-of-scope rows
+ * resolve to `null`, so a wrong identity sees a 404, not another scope's data.
+ */
+function buildContentIsolationFilter(
+  iso: RequestIsolation | undefined,
+): { teamId?: string; userId?: string; agentId?: string; taskId?: string } | undefined {
+  if (!iso) return undefined;
+  const filter: { teamId?: string; userId?: string; agentId?: string; taskId?: string } = {};
+  if (iso.teamId) filter.teamId = iso.teamId;
+  if (iso.userId) filter.userId = iso.userId;
+  if (iso.agentId) filter.agentId = iso.agentId;
+  if (iso.taskId) filter.taskId = iso.taskId;
+  return Object.keys(filter).length > 0 ? filter : undefined;
+}
+
+// ============================
+// History-mode guards (bypass-path checks)
+// ============================
+//
+// Once content history is enabled the ONLY normal write entry is
+// `POST /v3/content/write`: it carries an explicit `operation_id` and
+// `expected_version_id`, and the CAS re-check happens inside the store's own
+// transaction. Every legacy mutation endpoint that would otherwise perform a
+// non-CAS modification (`atomic/update`, `atomic/delete`, `conversation/delete`,
+// `scenario/write`, `scenario/rm`, `core/write`) is therefore refused here
+// instead of silently bypassing the version chain. `conversation/add` remains
+// an append: it never overwrites an existing locator, so it is routed through
+// the history-recording path rather than refused.
+
+/** Whether the bound SQLite store has content history enabled (L0/L1). */
+function storeContentHistoryEnabled(store: IMemoryStore | undefined): boolean {
+  // A capability read failure is NOT "history disabled": letting it fall through
+  // to `false` would silently re-open the legacy (non-CAS) write/delete path.
+  // The store's own `isContentHistoryEnabled()` is a pure boolean read, so any
+  // throw is a real defect and must surface (fail closed) rather than unlock
+  // legacy.
+  if (!store || typeof store.isContentHistoryEnabled !== "function") return false;
+  return store.isContentHistoryEnabled() === true;
+}
+
+/**
+ * Whether the request-scoped L2/L3 profile root has content history enabled.
+ *
+ * A backend that simply cannot host a version chain (getContentHistory absent /
+ * throws) is a capability absence → `false`. A FAILURE while reading the enable
+ * marker is NOT "history disabled": it is surfaced so the guard fails CLOSED
+ * instead of silently letting a legacy write bypass the version chain.
+ */
+async function profileContentHistoryEnabled(deps: V2RouterDeps): Promise<boolean> {
+  const base = deps.getStorage();
+  if (!base) return false;
+  let history: ReturnType<StorageAdapter["getContentHistory"]>;
+  try {
+    const storage = scopedProfileStorage(base, deps.requestIsolation);
+    history = storage.getContentHistory();
+  } catch {
+    // Scoped backend without a local publish root → cannot host L2/L3 history.
+    return false;
+  }
+  if (!history) return false;
+  return await history.isEnabled();
+}
+
+/** Refuse an L0/L1 legacy mutation that cannot carry a CAS baseline. */
+function historyModeStoreWriteForbidden(store: IMemoryStore | undefined, requestId: string, operation: string): ApiResponseEnvelope | null {
+  if (!storeContentHistoryEnabled(store)) return null;
+  return errorEnvelope(
+    409,
+    `history_write_forbidden: content history is enabled, so ${operation} cannot modify content without an explicit ` +
+      `operation_id + expected_version_id; use POST /v3/content/write`,
+    requestId,
+  );
+}
+
+/** Refuse a destructive delete in history mode: it is not defined, never retired silently. */
+function historyModeDeleteForbidden(store: IMemoryStore | undefined, requestId: string, operation: string): ApiResponseEnvelope | null {
+  if (!storeContentHistoryEnabled(store)) return null;
+  return errorEnvelope(
+    409,
+    `history_delete_undefined: destructive delete (${operation}) is not defined while content history is enabled; ` +
+      `use an explicit retire via POST /v3/content/write, or wait for the confirmed permanent-forget flow`,
+    requestId,
+  );
+}
+
+/** Refuse an L2/L3 legacy content mutation that cannot carry a CAS baseline. */
+async function historyModeLocalWriteForbidden(deps: V2RouterDeps, requestId: string, operation: string): Promise<ApiResponseEnvelope | null> {
+  if (!(await profileContentHistoryEnabled(deps))) return null;
+  return errorEnvelope(
+    409,
+    `history_write_forbidden: content history is enabled, so ${operation} cannot modify content without an explicit ` +
+      `operation_id + expected_version_id; use POST /v3/content/write`,
+    requestId,
+  );
+}
+
+/** Refuse an L2/L3 destructive delete in history mode. */
+async function historyModeLocalDeleteForbidden(deps: V2RouterDeps, requestId: string, operation: string): Promise<ApiResponseEnvelope | null> {
+  if (!(await profileContentHistoryEnabled(deps))) return null;
+  return errorEnvelope(
+    409,
+    `history_delete_undefined: destructive delete (${operation}) is not defined while content history is enabled; ` +
+      `use an explicit retire via POST /v3/content/write, or wait for the confirmed permanent-forget flow`,
+    requestId,
+  );
+}
+
+// ============================
+// L0 append via the formal history commit (conversation/add)
+// ============================
+
+/** Canonical JSON (sorted keys, `undefined` dropped) for the append fingerprint. */
+function canonicalJson(value: unknown): string {
+  if (value === null || value === undefined || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const entries = Object.keys(value as Record<string, unknown>).sort();
+  return `{${entries
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`)
+    .join(",")}}`;
+}
+
+/** The L0 object scope of an appended message (includes the session). */
+function l0AppendScope(sessionId: string, iso: RequestIsolation | undefined): HistoryScope {
+  const scope: HistoryScope = {
+    team_id: iso?.teamId || DEFAULT_ISOLATION_ID,
+    user_id: iso?.userId || DEFAULT_ISOLATION_ID,
+    agent_id: iso?.agentId || DEFAULT_ISOLATION_ID,
+    session_id: sessionId || DEFAULT_ISOLATION_ID,
+  };
+  if (iso?.taskId) scope.task_id = iso.taskId;
+  return scope;
+}
+
+/** Epoch ms of a caller-supplied message time (number or ISO/date string), else null. */
+function messageTimeMs(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value) {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+/**
+ * The normalized request fingerprint of one appended message. It captures the
+ * message semantics (id / session / role / body / times / task) so a repeat is
+ * idempotent while a different role/session/time under the same id conflicts.
+ */
+function fingerprintL0Append(
+  id: string,
+  msg: { role?: unknown; content?: unknown; recorded_at?: unknown; timestamp?: unknown; source?: unknown },
+  sessionId: string,
+  iso: RequestIsolation | undefined,
+): string {
+  return createHash("sha256")
+    .update(canonicalJson({
+      layer: "l0",
+      id,
+      session_id: sessionId,
+      role: typeof msg.role === "string" ? msg.role : null,
+      source: msg.source === "framework_event" ? "framework_event" : "conversation",
+      content: typeof msg.content === "string" ? msg.content : null,
+      recorded_at: typeof msg.recorded_at === "string" ? msg.recorded_at : null,
+      timestamp: msg.timestamp === undefined ? null : msg.timestamp,
+      task_id: iso?.taskId ?? null,
+    }))
+    .digest("hex");
+}
+
+/**
+ * Build the `create` L0 mutation for one appended message. No per-request
+ * wall-clock is embedded: when the caller supplies no message time, the
+ * program's commit clock stands in for `message_recorded_at` (and the version's
+ * `recorded_at`), so the payload stays replay-stable.
+ */
+function buildL0AppendMutation(
+  id: string,
+  msg: { role?: unknown; content?: unknown; recorded_at?: unknown; timestamp?: unknown; source?: unknown },
+  sessionId: string,
+  iso: RequestIsolation | undefined,
+): VersionMutation {
+  const ms = messageTimeMs(msg.timestamp) ?? messageTimeMs(msg.recorded_at);
+  const metadata = buildL0VersionMetadata(null, {
+    role: typeof msg.role === "string" ? msg.role : "user",
+    source: msg.source === "framework_event" ? "framework_event" : "conversation",
+    sessionKey: sessionId,
+    sessionId,
+    taskId: iso?.taskId ?? "",
+    messageRecordedAt: ms !== null ? new Date(ms).toISOString() : "",
+    originalTimestampMs: ms ?? 0,
+  });
+  if (!metadata.message_recorded_at) delete metadata.message_recorded_at;
+  return {
+    draft: {
+      layer: "l0",
+      locator: id,
+      scope: l0AppendScope(sessionId, iso),
+      body: typeof msg.content === "string" ? msg.content : "",
+      metadata,
+      state: "active",
+    },
+    expected_version_id: null,
+    predecessors: [],
+    change_kind: "create",
+  };
+}
+
+/** The (mirror/notify) L0 record of a freshly committed append. */
+function l0AppendRecord(
+  version: ContentVersion,
+  msg: { role?: unknown },
+): L0Record {
+  const meta = (version.metadata ?? {}) as Record<string, unknown>;
+  const recordedAt = typeof meta.message_recorded_at === "string" && meta.message_recorded_at
+    ? meta.message_recorded_at
+    : version.recorded_at;
+  return {
+    id: version.locator,
+    sessionKey: typeof meta.session_key === "string" ? meta.session_key : version.scope.session_id ?? "",
+    sessionId: version.scope.session_id ?? "",
+    taskId: typeof meta.task_id === "string" ? meta.task_id : undefined,
+    teamId: version.scope.team_id,
+    userId: version.scope.user_id,
+    agentId: version.scope.agent_id,
+    role: typeof meta.role === "string" ? meta.role : (typeof msg.role === "string" ? msg.role : "user"),
+    source: meta.source === "framework_event" ? "framework_event" : "conversation",
+    messageText: version.body,
+    recordedAt,
+    timestamp: typeof meta.original_timestamp_ms === "number" ? meta.original_timestamp_ms : 0,
+  };
+}
+
+/** Read one committed operation from the store's own formal chain (read-only). */
+async function lookupL0CommittedOperation(
+  store: IMemoryStore | undefined,
+  scope: HistoryScope,
+  operationId: string,
+): Promise<CommittedOperationRecord | null> {
+  const reader = store?.getContentHistory?.();
+  const getter = (reader as unknown as
+    | { getCommittedOperation?: (scope: HistoryScope, operationId: string) => CommittedOperationRecord | null }
+    | undefined)?.getCommittedOperation;
+  if (typeof getter !== "function") return null;
+  return getter.call(reader, scope, operationId);
+}
+
+/** Stable error code → transport status for an L0/L1 history commit failure. */
+function historyWriteStatus(code: unknown): number {
+  switch (code) {
+    case "history_scope_mismatch":
+    case "scope_mismatch":
+      return 403;
+    case "unknown_content_id":
+    case "version_not_found":
+      return 404;
+    case "history_operation_conflict":
+    case "operation_conflict":
+    case "history_version_conflict":
+    case "stale_expected_version":
+    case "history_locator_conflict":
+    case "locator_in_use":
+    case "content_id_exists":
+    case "history_retired_conflict":
+    case "history_predecessor_not_current":
+    case "predecessor_not_current":
+    case "history_current_diverged":
+    case "history_current_conflict":
+    case "history_not_enabled":
+    case "clock_regressed":
+      return 409;
+    case "history_layer_unsupported":
+    case "history_bound_commit_unsupported":
+    case "history_unavailable":
+      return 501;
+    case "history_invalid_input":
+    case "invalid_mutation":
+    case "invalid_locator":
+      return 400;
+    default:
+      return 500;
+  }
+}
+
+function parseSourceMessageIdsJson(raw: string | undefined, recordId?: string, logger?: Logger): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      logger?.warn?.(`${TAG} source_message_ids_json for ${recordId ?? "?"} is not an array (treated as unknown)`);
+      return [];
+    }
+    return parsed.filter((v): v is string => typeof v === "string" && v.length > 0);
+  } catch {
+    logger?.warn?.(`${TAG} source_message_ids_json for ${recordId ?? "?"} is malformed (treated as unknown)`);
+    return [];
+  }
+}
+
+/** Build the L1 source view; an empty citation set is explicitly `unknown`. */
+function buildAtomicSourceView(ids: string[]): AtomicSourceView {
+  const valid = ids.filter((id) => typeof id === "string" && id.length > 0);
+  if (valid.length === 0) return { status: "unknown", kind: "model_declared", message_ids: [] };
+  return { status: "declared", kind: "model_declared", message_ids: valid };
+}
+
+// ============================
+// Content-history view builders
+// ============================
+//
+// These turn an exact stored `ContentVersion` into the shape the existing
+// single-read endpoints already return. They are only used when the caller
+// asked for an explicit `version_id` (or when history is enabled and a ref is
+// attached); the legacy response shape is untouched otherwise.
+
+/** An L0 message view built from its historical version (metadata is canonical). */
+function conversationItemFromVersion(version: ContentVersion, fallback: ConversationItem): ConversationItem {
+  const meta = (version.metadata ?? {}) as Record<string, unknown>;
+  const role = typeof meta.role === "string" ? meta.role : fallback.role;
+  const recordedAt = typeof meta.message_recorded_at === "string" ? meta.message_recorded_at : version.recorded_at;
+  const item: ConversationItem = {
+    id: version.locator,
+    session_id: version.scope.session_id ?? fallback.session_id,
+    team_id: version.scope.team_id ?? fallback.team_id,
+    user_id: version.scope.user_id ?? fallback.user_id,
+    agent_id: version.scope.agent_id ?? fallback.agent_id,
+    task_id: version.scope.task_id ?? fallback.task_id,
+    role: role as ConversationItem["role"],
+    content: version.body,
+    timestamp: recordedAt,
+  };
+  return item;
+}
+
+/** The model-declared source view of a stored L1 version. */
+function atomicSourceFromVersion(version: ContentVersion): AtomicSourceView {
+  const meta = (version.metadata ?? {}) as Record<string, unknown>;
+  const ids = Array.isArray(meta.source_message_ids)
+    ? meta.source_message_ids.filter((v): v is string => typeof v === "string")
+    : [];
+  return buildAtomicSourceView(ids);
+}
+
+/** An L1 item view built from a stored historical version. */
+function atomicItemFromVersion(version: ContentVersion, current: boolean): AtomicGetData["item"] {
+  const meta = (version.metadata ?? {}) as Record<string, unknown>;
+  return {
+    id: version.locator,
+    type: typeof meta.type === "string" ? meta.type : "",
+    content: version.body,
+    background: typeof meta.scene_name === "string" && meta.scene_name ? meta.scene_name : undefined,
+    version: 0,
+    team_id: version.scope.team_id,
+    user_id: version.scope.user_id,
+    agent_id: version.scope.agent_id,
+    task_id: version.scope.task_id,
+    created_at: version.recorded_at,
+    updated_at: version.recorded_at,
+    current,
+    ref: { ...version.ref },
+    source: atomicSourceFromVersion(version),
+  };
+}
+
 async function getProfileVersion(
   store: IMemoryStore | undefined,
   type: "l2" | "l3",
@@ -1789,14 +2587,24 @@ async function handleScenarioLs(body: unknown, _auth: V2AuthContext, requestId: 
   deps.logger.debug?.(`${TAG} [scenario/ls] storage.type=${storage.type}, prefix="${prefix}"`);
 
   // One-shot full listing (no pagination; marker-based pagination planned for phase 2)
-  const backend = storage.getBackend();
-  const result = await backend.listObjects(prefix, { recursive: true });
+  // A single pinned snapshot keeps the listing and the index on the same
+  // revision, so a concurrent publish cannot produce a mixed view.
+  const snap = await openPublishedSnapshotOf(storage.getBackend());
+  const result = snap
+    ? await snap.list(prefix, { recursive: true })
+    : await storage.getBackend().listObjects(prefix, { recursive: true });
   deps.logger.debug?.(`${TAG} [scenario/ls] listObjects returned ${result.entries.length} entries`);
   const allEntries = result.entries;
 
-  // Read scene_index.json for summary + created/updated lookup
-  const { readSceneIndex } = await import("../core/scene/scene-index.js");
-  const sceneIndex = await readSceneIndex("", storage);
+  // Read scene_index.json for summary + created/updated lookup (same snapshot)
+  let sceneIndex: Array<{ filename: string; summary?: string; created?: string; updated?: string }>;
+  if (snap) {
+    const indexObj = await snap.read(StoragePaths.sceneIndex);
+    sceneIndex = indexObj ? parseSceneIndexEntries(indexObj.content.toString("utf-8")) : [];
+  } else {
+    const { readSceneIndex } = await import("../core/scene/scene-index.js");
+    sceneIndex = await readSceneIndex("", storage);
+  }
   const indexMap = new Map(sceneIndex.map((e) => [e.filename, e]));
 
   // 批量获取所有 L2 文件的 profile version（一次查询，避免 N+1）
@@ -1861,12 +2669,57 @@ async function handleScenarioRead(body: unknown, _auth: V2AuthContext, requestId
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
   const { path } = parsed.data;
 
+  // Historical L2 reads are not implemented this round. A supplied numeric
+  // `version` is rejected explicitly so callers cannot mistake an ignored field
+  // for a reliable versioned read. The string `version_id` is the history-aware
+  // alternative and is only meaningful once content history is enabled.
+  if (parsed.data.version !== undefined) {
+    return errorEnvelope(400, "unsupported_version: historical L2 reads are not implemented; omit version", requestId);
+  }
+
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
   const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
 
   const key = `${StoragePaths.sceneBlocksDir}${path}`;
-  const content = await storage.readFile(key);
+
+  // Content-history reference (and, when `version_id` is set, the exact
+  // historical body). Legacy mode returns no ref and never silently reads the
+  // current bytes for a requested version.
+  const history = await resolveLocalLocatorHistory(deps, "l2", key, parsed.data.version_id);
+  if (!history.ok) return errorEnvelope(history.failure.status, history.failure.message, requestId);
+  if (history.version) {
+    // The ref, body and sources all come from ONE pinned version, so a
+    // concurrent commit cannot pair an old ref with a newer body. The numeric
+    // legacy version only describes the live profile row; for an explicit
+    // historical read it is omitted rather than passing the current number off
+    // as the old version's number.
+    const explicit = parsed.data.version_id !== undefined;
+    if (!explicit && history.version.state === "retired") {
+      return successEnvelope({ path, content: null, state: "retired", ref: history.ref, sources: unknownContentSource() }, requestId);
+    }
+    const historical: ScenarioFile = {
+      path,
+      content: history.version.body,
+      team_id: history.version.scope.team_id ?? deps.requestIsolation?.teamId,
+      agent_id: history.version.scope.agent_id ?? deps.requestIsolation?.agentId,
+      created_at: history.version.recorded_at,
+      updated_at: history.version.recorded_at,
+      // The version's OWN recorded sources: never the current sidecar (which
+      // describes other bytes), and never erased to `unknown` when the version
+      // already recorded real input sources.
+      sources: contentSourceViewFromVersion(history.version),
+    };
+    if (history.ref) historical.ref = history.ref;
+    return successEnvelope({ ...historical, state: history.version.state, content_version: contentVersionView(history.version) }, requestId);
+  }
+  // Pin one revision so content + index + stat all come from the same bundle.
+  const snap = await openPublishedSnapshotOf(storage.getBackend());
+  const sourceStorage = snap ? { readFile: async (key: string) => (await snap.read(key))?.content.toString("utf-8") ?? null } as StorageAdapter : storage;
+  const contentObj = snap ? await snap.read(key) : null;
+  const content = snap
+    ? (contentObj ? contentObj.content.toString("utf-8") : null)
+    : await storage.readFile(key);
 
   // File not found → return 200 with null content (not 404)
   if (content === null) {
@@ -1875,6 +2728,7 @@ async function handleScenarioRead(body: unknown, _auth: V2AuthContext, requestId
       content: null as unknown as string,
       created_at: null as unknown as string,
       updated_at: null as unknown as string,
+      sources: unknownContentSource(),
     }, requestId);
   }
 
@@ -1895,30 +2749,45 @@ async function handleScenarioRead(body: unknown, _auth: V2AuthContext, requestId
       }
     }
   } else {
-    // Fallback: try scene_index
-    const { readSceneIndex } = await import("../core/scene/scene-index.js");
-    const sceneIndex = await readSceneIndex("", storage);
-    const entry = sceneIndex.find((e) => e.filename === path);
+    // Fallback: try scene_index (same pinned snapshot)
+    let entry: { created?: string; updated?: string } | undefined;
+    if (snap) {
+      const indexObj = await snap.read(StoragePaths.sceneIndex);
+      entry = indexObj
+        ? parseSceneIndexEntries(indexObj.content.toString("utf-8")).find((e) => e.filename === path)
+        : undefined;
+    } else {
+      const { readSceneIndex } = await import("../core/scene/scene-index.js");
+      const sceneIndex = await readSceneIndex("", storage);
+      entry = sceneIndex.find((e) => e.filename === path);
+    }
     if (entry) {
       createdAt = entry.created || now;
       updatedAt = entry.updated || now;
     } else {
-      const stat = await storage.stat(key);
-      if (stat) {
-        createdAt = new Date(stat.lastModified).toISOString();
+      const lastModified = snap ? contentObj?.lastModified : (await storage.stat(key))?.lastModified;
+      if (lastModified) {
+        createdAt = new Date(lastModified).toISOString();
         updatedAt = createdAt;
       }
     }
   }
 
-  return successEnvelope<ScenarioFile>({
+  const file: ScenarioFile = {
     path, content,
     version: await getProfileVersion(deps.getStore(), "l2", path, deps.requestIsolation),
     team_id: deps.requestIsolation?.teamId,
     agent_id: deps.requestIsolation?.agentId,
     created_at: createdAt,
     updated_at: updatedAt,
-  }, requestId);
+    // Program-provided input scope for this file; hash-bound to the exact bytes
+    // just read, so a stale sidecar can never be attached to changed content.
+    // `unknown` when none was persisted (never an empty list implying "no
+    // evidence"); `unavailable` when the sidecar itself could not be read.
+    sources: await readContentSourceViewForContent(sourceStorage, "l2", path, content),
+  };
+  if (history.ref) file.ref = history.ref;
+  return successEnvelope<ScenarioFile>(file, requestId);
 }
 
 async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1929,6 +2798,10 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
   const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+
+  // History mode: an L2 modification without a CAS baseline is refused; use content/write.
+  const historyForbidden = await historyModeLocalWriteForbidden(deps, requestId, "scenario/write");
+  if (historyForbidden) return historyForbidden;
 
   const key = `${StoragePaths.sceneBlocksDir}${path}`;
 
@@ -1968,6 +2841,12 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
 
   await storage.writeFile(key, finalContent);
 
+  // Direct API write changes the bytes under the sidecar: drop the old
+  // pipeline relation so it can never be served for the new content. A removal
+  // failure is surfaced (not swallowed) — a success response must not leave a
+  // stale source relation behind.
+  await removeContentSources(storage, [{ layer: "l2", path }]);
+
   // Sync L2 to VDB profiles + refresh scene index (best-effort)
   const store = deps.getStore();
   const version = await syncProfileToVdb(store, "l2", path, finalContent, deps.logger, undefined, deps.requestIsolation);
@@ -2001,6 +2880,10 @@ async function handleScenarioRm(body: unknown, _auth: V2AuthContext, requestId: 
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
   const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+
+  // History mode refuses a destructive L2 delete; retire via content/write instead.
+  const historyForbidden = await historyModeLocalDeleteForbidden(deps, requestId, "scenario/rm");
+  if (historyForbidden) return historyForbidden;
 
   const key = `${StoragePaths.sceneBlocksDir}${path}`;
   // Collect filenames to delete from VDB (single file or all files under a directory)
@@ -2041,13 +2924,62 @@ async function handleScenarioRm(body: unknown, _auth: V2AuthContext, requestId: 
 // L3 Core Handlers
 // ============================
 
-async function handleCoreRead(_body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+async function handleCoreRead(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  const parsed = coreReadRequestSchema.safeParse(body ?? {});
+  if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
+  // Historical L3 reads are not implemented this round; reject an explicit
+  // numeric version instead of silently ignoring it. `version_id` is the
+  // history-aware alternative (see the L2 handler).
+  if (parsed.data.version !== undefined) {
+    return errorEnvelope(400, "unsupported_version: historical L3 reads are not implemented; omit version", requestId);
+  }
+
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
   const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
 
+  // Content-history reference (and the exact historical persona when a
+  // `version_id` was requested). Legacy mode returns no ref.
+  const history = await resolveLocalLocatorHistory(deps, "l3", StoragePaths.persona, parsed.data.version_id);
+  if (!history.ok) return errorEnvelope(history.failure.status, history.failure.message, requestId);
+  if (history.version) {
+    // Same single-snapshot rule as scenario/read: ref + body + sources all come
+    // from the one pinned version. The numeric legacy version is only kept for
+    // the current read; an explicit historical read must not report the live
+    // profile number as the old version's number.
+    const explicit = parsed.data.version_id !== undefined;
+    if (!explicit && history.version.state === "retired") {
+      return successEnvelope({ content: null, state: "retired", ref: history.ref, sources: unknownContentSource() }, requestId);
+    }
+    const historical: CoreFile = {
+      content: history.version.body,
+      team_id: history.version.scope.team_id ?? deps.requestIsolation?.teamId,
+      agent_id: history.version.scope.agent_id ?? deps.requestIsolation?.agentId,
+      created_at: history.version.recorded_at,
+      updated_at: history.version.recorded_at,
+      sources: contentSourceViewFromVersion(history.version),
+    };
+    if (history.ref) historical.ref = history.ref;
+    return successEnvelope({ ...historical, state: history.version.state, content_version: contentVersionView(history.version) }, requestId);
+  }
+
   deps.logger.debug?.(`${TAG} [core/read] storage.type=${storage.type}, key="${StoragePaths.persona}"`);
-  const content = await storage.readFile(StoragePaths.persona);
+
+  // Pin one revision: content, sources and stat must come from the same bundle.
+  const snap = await openPublishedSnapshotOf(storage.getBackend());
+  const sourceStorage = snap ? { readFile: async (key: string) => (await snap.read(key))?.content.toString("utf-8") ?? null } as StorageAdapter : storage;
+  let content: string | null;
+  let lastModifiedMs: number | undefined;
+  if (snap) {
+    const obj = await snap.read(StoragePaths.persona);
+    content = obj ? obj.content.toString("utf-8") : null;
+    lastModifiedMs = obj?.lastModified?.getTime();
+  } else {
+    content = await storage.readFile(StoragePaths.persona);
+    if (content !== null) {
+      lastModifiedMs = (await storage.stat(StoragePaths.persona))?.lastModified;
+    }
+  }
   deps.logger.debug?.(`${TAG} [core/read] readFile result: ${content === null ? "null (not found)" : `${content.length} chars`}`);
 
   // File not found → return 200 with null content (not 404)
@@ -2056,20 +2988,23 @@ async function handleCoreRead(_body: unknown, _auth: V2AuthContext, requestId: s
       content: null as unknown as string,
       created_at: null as unknown as string,
       updated_at: null as unknown as string,
+      sources: unknownContentSource(),
     }, requestId);
   }
 
-  const stat = await storage.stat(StoragePaths.persona);
   const now = new Date().toISOString();
 
-  return successEnvelope<CoreFile>({
+  const file: CoreFile = {
     content,
     version: await getProfileVersion(deps.getStore(), "l3", StoragePaths.persona, deps.requestIsolation),
     team_id: deps.requestIsolation?.teamId,
     agent_id: deps.requestIsolation?.agentId,
-    created_at: stat ? new Date(stat.createdAt).toISOString() : now,
-    updated_at: stat ? new Date(stat.lastModified).toISOString() : now,
-  }, requestId);
+    created_at: lastModifiedMs !== undefined ? new Date(lastModifiedMs).toISOString() : now,
+    updated_at: lastModifiedMs !== undefined ? new Date(lastModifiedMs).toISOString() : now,
+    sources: await readContentSourceViewForContent(sourceStorage, "l3", StoragePaths.persona, content),
+  };
+  if (history.ref) file.ref = history.ref;
+  return successEnvelope<CoreFile>(file, requestId);
 }
 
 async function handleCoreCount(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -2102,6 +3037,10 @@ async function handleCoreWrite(body: unknown, _auth: V2AuthContext, requestId: s
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
   const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
 
+  // History mode: an L3 modification without a CAS baseline is refused; use content/write.
+  const historyForbidden = await historyModeLocalWriteForbidden(deps, requestId, "core/write");
+  if (historyForbidden) return historyForbidden;
+
   // Normalize before persistence: persona body must NOT contain Scene Navigation
   // (a derived section rebuilt from scene_index.json) or stray surrounding
   // whitespace. Both COS and VDB get the *exact* same bytes so md5(content) is
@@ -2113,6 +3052,9 @@ async function handleCoreWrite(body: unknown, _auth: V2AuthContext, requestId: s
   const personaBody = stripSceneNavigation(content).trim();
 
   await storage.writeFile(StoragePaths.persona, personaBody);
+
+  // Direct API write invalidates the old pipeline relation (see scenario/write).
+  await removeContentSources(storage, [{ layer: "l3", path: StoragePaths.persona }]);
 
   // Sync L3 persona to VDB profiles (best-effort)
   const store = deps.getStore();
@@ -2270,6 +3212,22 @@ function formatLocalDateForJsonl(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
+/** Parse a scene_index.json payload to filename-scoped entries (lenient). */
+function parseSceneIndexEntries(
+  raw: string,
+): Array<{ filename: string; summary?: string; created?: string; updated?: string }> {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (entry): entry is { filename: string; summary?: string; created?: string; updated?: string } =>
+        !!entry && typeof entry === "object" && typeof entry.filename === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
 // ============================
 // Exported for testing
 // ============================
@@ -2277,11 +3235,13 @@ function formatLocalDateForJsonl(d: Date): string {
 export {
   handleConversationAdd,
   handleConversationQuery,
+  handleConversationGet,
   handleConversationSearch,
   handleConversationDelete,
   handleConversationCount,
   handleAtomicUpdate,
   handleAtomicQuery,
+  handleAtomicGet,
   handleAtomicSearch,
   handleAtomicDelete,
   handleAtomicCount,
@@ -2293,6 +3253,10 @@ export {
   handleCoreRead,
   handleCoreWrite,
   handleCoreCount,
+  handleContentRead,
+  handleContentHistory,
+  handleContentChanges,
+  handleContentWrite,
   handleTeamCreate,
   handleTeamGet,
   handleTeamUpdate,

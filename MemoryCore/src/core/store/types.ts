@@ -21,6 +21,8 @@ import type { Logger } from "../types.js";
 import type { IsolationFilter } from "./isolation.js";
 import type { MemoryPromptStore } from "../memory-prompt/types.js";
 import type { MemoryGenerationRefStore } from "../memory-generation-log/types.js";
+import type { ChangeCommit, ChangeCommitResult, HistoryScope } from "../content/history-contract.js";
+import type { CommitContentChangesOptions } from "../content/history-write.js";
 
 // Re-export so consumers can import everything from types.ts
 export type { MemoryRecord, EmbeddingProviderInfo };
@@ -111,6 +113,21 @@ export interface L1QueryFilter {
   updatedAfter?: string;
 }
 
+/**
+ * One old→new L1 supersession with the old row's full content captured at
+ * replacement time. `record_json` is the serialized old `MemoryRecord` shape
+ * (id/content/type/metadata/source ids/timestamps/identity), so callers can
+ * audit or restore without depending on the JSONL mirror or logs.
+ */
+export interface L1SupersessionRow {
+  old_id: string;
+  new_id: string;
+  action: string;
+  /** Serialized old row (JSON). */
+  record_json: string;
+  superseded_at_ms: number;
+}
+
 /** Row shape returned by L1 query methods. */
 export interface L1RecordRow {
   record_id: string;
@@ -131,17 +148,77 @@ export interface L1RecordRow {
   created_time: string;
   updated_time: string;
   metadata_json: string;
+  /**
+   * Model-declared source message ids, JSON-encoded.
+   *
+   * Optional so pre-existing rows / statement shapes stay valid; new writes
+   * always populate it (possibly `"[]"`). Callers parse it rather than
+   * trusting an arbitrary metadata field with permission-like meaning.
+   */
+  source_message_ids_json?: string;
+}
+
+/**
+ * A superseded (replaced) L1 record retained for read-by-old-id.
+ *
+ * When an update/merge replaces an existing record, the old row is archived
+ * here before deletion so `atomic/get` can still return the old content and
+ * point at the record that replaced it. `new_id` may be empty when the
+ * replacement link could not be written — the API then reports the old row as
+ * not-current with an unknown target instead of fabricating one.
+ */
+/**
+ * Result of an atomic L1 replacement.
+ *
+ * `replaced` is `false` only when the store could not perform the replacement
+ * (e.g. degraded). Callers must not treat a non-replaced result as success.
+ */
+export interface L1ReplaceResult {
+  replaced: boolean;
+  /** Old ids that were archived + deleted (subset of the requested ids). */
+  superseded: string[];
+}
+
+export interface L1SupersededRow {
+  old_id: string;
+  new_id: string;
+  content: string;
+  type: string;
+  priority: number;
+  scene_name: string;
+  session_key: string;
+  session_id: string;
+  team_id: string;
+  task_id: string;
+  user_id: string;
+  agent_id: string;
+  source_message_ids: string[];
+  metadata_json: string;
+  version: number;
+  created_time: string;
+  updated_time: string;
+  superseded_at_ms: number;
 }
 
 // ============================
 // L0 Types (Raw Conversations)
 // ============================
 
+/**
+ * Where an L0 message came from (2026-10-12 架构, docs/memory-design-proposal.md §5.2):
+ *   - `conversation`: 用户消息或模型回复（默认）；
+ *   - `framework_event`: 框架追加进会话的消息（钩子通知、分身问答、背景追加），
+ *     不当作用户原话。
+ */
+export type L0MessageSource = "conversation" | "framework_event";
+
 /** An L0 conversation message record for vector indexing. */
 export interface L0Record {
   id: string;
   sessionKey: string;
   sessionId: string;
+  /** Message provenance; absent means `conversation` for legacy callers. */
+  source?: L0MessageSource;
   /**
    * Three-dim isolation (new in this branch).
    *
@@ -334,6 +411,37 @@ export interface IProfileRowStore {
 
 /** An {@link IMemoryStore} that is statically known to serve profile rows. */
 export type ProfileRowCapableStore = IMemoryStore & IProfileRowStore;
+
+// ============================
+// Committed operation read (idempotent replay)
+// ============================
+//
+// A caller may want to know whether an `operation_id` was already committed in
+// a scope and, if so, replay the EXACT original `ChangeCommitResult` instead of
+// rebuilding the request from today's current state (which could drift). This is
+// a read-only lookup against the store's OWN formal chain: it opens no second
+// idempotency database, keeps no volatile process map and never scans logs.
+//
+// `request_fingerprint` is the normalized client-request semantics the commit
+// was first assembled for — a program-written field, never a caller's
+// `user_metadata`. A null fingerprint means the operation predates fingerprint
+// recording and therefore cannot be verified: the caller must NOT treat it as a
+// match.
+
+export interface CommittedOperationRecord {
+  operation_id: string;
+  scope: HistoryScope;
+  request_fingerprint: string | null;
+  result: ChangeCommitResult;
+}
+
+/** Read-only committed-operation lookup capability. */
+export interface CommittedOperationReader {
+  getCommittedOperation(
+    scope: HistoryScope,
+    operationId: string,
+  ): MaybePromise<CommittedOperationRecord | null>;
+}
 
 // ============================
 // v2 API Paginated Query Types
@@ -615,12 +723,46 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   deleteL1(recordId: string, filter?: IsolationFilter): MaybePromise<boolean>;
   deleteL1Batch(recordIds: string[], filter?: IsolationFilter): MaybePromise<boolean>;
   deleteL1Expired(cutoffIso: string): MaybePromise<number>;
+  /**
+   * Old record ids that were replaced by `newRecordId`. Backed by the store's
+   * own replacement table so history does not depend on JSONL or logs.
+   * Optional; unsupported stores return an empty list or undefined.
+   */
+  queryL1ReplacementTargets?(newRecordId: string): MaybePromise<string[]>;
+  /**
+   * Supersession history with the full old row preserved as JSON. Required for
+   * old-content queries during a correction; unsupported stores omit it.
+   */
+  queryL1Supersessions?(newRecordId: string): MaybePromise<L1SupersessionRow[]>;
 
   // ── L1 Read ──────────────────────────────────────────────
 
   countL1(filter?: L1CountFilter): MaybePromise<number>;
   queryL1Records(filter?: L1QueryFilter): MaybePromise<L1RecordRow[]>;
   getAllL1Texts(): MaybePromise<Array<{ record_id: string; content: string; updated_time: string }>>;
+
+  /**
+   * Read one L1 record by primary key, honouring the isolation filter.
+   * Returns `null` when absent OR outside the caller's scope — callers must
+   * not distinguish the two (existence must not leak across scopes).
+   *
+   * Optional capability: a store that omits it makes `atomic/get` return an
+   * explicit `unsupported` error instead of a fabricated miss.
+   */
+  getL1RecordById?(recordId: string, filter?: IsolationFilter): MaybePromise<L1RecordRow | null>;
+
+  /**
+   * Read an archived (superseded) L1 record by its old id, honouring the
+   * isolation filter. Optional; see {@link getL1RecordById}.
+   */
+  getL1SupersededRecord?(oldId: string, filter?: IsolationFilter): MaybePromise<L1SupersededRow | null>;
+
+  /**
+   * @deprecated Do NOT call from the writer: archive-then-delete is not
+   * atomic. 收窄后不再存在替代式写入路径（去重只新增或跳过完全重复），本
+   * 方法仅为既有后端/测试保留，不应再被调用。
+   */
+  archiveL1Supersessions?(oldIds: string[], newId: string, filter?: IsolationFilter): MaybePromise<number>;
 
   // ── L1 Search ────────────────────────────────────────────
 
@@ -655,6 +797,12 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   // ── L0 Read ──────────────────────────────────────────────
 
   countL0(filter?: L0CountFilter): MaybePromise<number>;
+  /**
+   * Read one L0 record by primary key, honouring the isolation filter.
+   * Returns `null` when absent OR outside the caller's scope. Optional;
+   * `conversation/get` returns an explicit `unsupported` error when missing.
+   */
+  getL0RecordById?(recordId: string, filter?: IsolationFilter): MaybePromise<L0QueryRow | null>;
   queryL0ForL1(sessionKey: string, afterRecordedAtMs?: number, limit?: number): MaybePromise<L0QueryRow[]>;
   queryL0GroupedBySessionId(sessionKey: string, afterRecordedAtMs?: number, limit?: number): MaybePromise<L0SessionGroup[]>;
   getAllL0Texts(): MaybePromise<Array<{ record_id: string; message_text: string; recorded_at: string }>>;
@@ -686,6 +834,43 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   countProfiles?(filter?: ProfileFilter): Promise<number>;
   syncProfiles?(records: ProfileSyncRecord[]): Promise<void>;
   deleteProfiles?(recordIds: string[]): Promise<void>;
+
+  // ── Content history (read-only capability surface, §4.8) ────
+  //
+  // Optional so a backend that cannot host an immutable version chain (TCVDB,
+  // Mongo, COS-only file stores) simply omits them; the gateway then reports an
+  // explicit `history_unavailable` instead of fabricating a version read.
+
+  /** Whether content-history versioning is active for this store. */
+  isContentHistoryEnabled?(): boolean;
+  /**
+   * The content-history reader for this store, when history is enabled. Its
+   * authorization-filtered queries keep scope resolution inside the store — the
+   * gateway never reads the raw DB or builds scope SQL itself.
+   */
+  getContentHistory?(): import("../content/history-reader.js").ScopedContentHistoryReader | undefined;
+
+  /**
+   * Apply one `ChangeCommit` of L0/L1 mutations in a SINGLE SQLite transaction:
+   * the current row, its FTS / vector index and the immutable content-history
+   * version commit together or not at all.
+   *
+   * This is the formal write entry — a caller must NOT pre-check a version and
+   * then call the legacy `upsertL1` to fake a compare-and-
+   * swap. `operation_id` de-duplication, `expected_version_id` / predecessor
+   * CAS, the original-record-id uniqueness and owner verification are all
+   * re-checked inside the transaction. Optional so a backend without a content
+   * history chain simply omits it (the gateway then reports an explicit
+   * `unsupported` instead of accepting an unversioned write).
+   *
+   * Change kinds the store cannot faithfully apply (`baseline`, `rename`, L2/L3)
+   * are refused explicitly rather than partially written.
+   */
+  commitContentChanges?(
+    commit: ChangeCommit,
+    filter: IsolationFilter,
+    options?: CommitContentChangesOptions,
+  ): MaybePromise<ChangeCommitResult>;
 
   // ── Re-index ─────────────────────────────────────────────
 

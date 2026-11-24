@@ -15,7 +15,7 @@
  */
 
 import type { MemoryPromptMode } from "../../config.js";
-import type { ExtractedMemory, MemoryRecord, DedupDecision, MemoryType } from "./l1-writer.js";
+import type { ExtractedMemory, MemoryRecord, DedupDecision } from "./l1-writer.js";
 import { formatBatchConflictPrompt, getConflictDetectionSystemPrompt } from "../prompts/l1-dedup.js";
 import type { CandidateMatch } from "../prompts/l1-dedup.js";
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
@@ -74,9 +74,11 @@ export async function batchDedup(params: {
   filter?: IsolationFilter;
   /** langfuse 上报身份四元组（team/user/agent/session），透传给 llmRunner。 */
   traceContext?: TraceContext;
+  failOnError?: boolean;
 }): Promise<DedupDecision[]> {
   const { memories, config, logger, model, promptMode = "chat", vectorStore, embeddingService, llmRunner, filter, traceContext } = params;
   const topK = params.conflictRecallTopK ?? 5;
+  const failOnError = params.failOnError === true;
 
   if (memories.length === 0) {
     return [];
@@ -86,7 +88,6 @@ export async function batchDedup(params: {
     memories.map((m) => ({
       record_id: m.record_id,
       action: "store" as const,
-      target_ids: [],
     }));
 
   // Determine what recall capabilities are available
@@ -131,7 +132,7 @@ export async function batchDedup(params: {
   }
 
   // Phase 2: Batch LLM judgment
-  return runLlmJudgment(matches, memories, config, logger, model, promptMode, llmRunner, traceContext);
+  return runLlmJudgment(matches, memories, config, logger, model, promptMode, llmRunner, traceContext, failOnError);
 }
 
 /**
@@ -146,6 +147,7 @@ async function runLlmJudgment(
   promptMode: MemoryPromptMode,
   llmRunner?: LLMRunner,
   traceContext?: TraceContext,
+  failOnError = false,
 ): Promise<DedupDecision[]> {
   logger?.debug?.(`${TAG} Running batch conflict detection for ${memories.length} memories (promptMode=${promptMode})`);
 
@@ -185,16 +187,24 @@ async function runLlmJudgment(
       });
     }
 
-    const decisions = parseBatchResult(result, memories, logger);
+    const decisions = parseBatchResult(result, memories, logger, failOnError);
+    if (failOnError) {
+      const expected = new Set(memories.map(m => m.record_id));
+      const seen = new Set<string>();
+      for (const d of decisions) {
+        if (!expected.has(d.record_id) || seen.has(d.record_id)) throw new Error("Invalid decision record id");
+        seen.add(d.record_id);
+      }
+    }
     return decisions;
   } catch (err) {
+    if (failOnError) throw err;
     logger?.warn?.(
       `${TAG} Batch conflict detection failed, defaulting all to store: ${err instanceof Error ? err.message : String(err)}`,
     );
     return memories.map((m) => ({
       record_id: m.record_id,
       action: "store" as const,
-      target_ids: [],
     }));
   }
 }
@@ -300,42 +310,23 @@ async function findCandidates(
 // Result parsing
 // ============================
 
-const VALID_TYPES: MemoryType[] = ["persona", "episodic", "instruction", "work_fact", "work_task", "work_method", "work_artifact"];
-
 /**
  * Parse the LLM's batch conflict detection JSON response.
  *
- * Expected format: [{record_id, action, target_ids, merged_content, merged_type, merged_priority, merged_timestamps}]
+ * 2026-10-12 收窄：只接受 store = 新增，skip = 完全重复所以跳过。模型被要求
+ * 不要执行替代旧认识的决策；出现其他 action 时 failOnError 下抛错，否则保守
+ * 地当作 store（绝不静默跳过新认识）。
+ *
+ * Expected format: [{record_id, action}]
  */
 function parseBatchResult(
   raw: string,
   memories: Array<ExtractedMemory & { record_id: string }>,
   logger?: Logger,
+  failOnError = false,
 ): DedupDecision[] {
   try {
     // ── Strip inline reasoning wrappers (A₂-style thinking models) ───────
-    // Mirror of l1-extractor.ts@ccaa5dc3: A₂ models (minimax-m3 / GLM-4-
-    // thinking / qwq-32b / some vLLM DeepSeek-R1) inline reasoning as
-    // `<think>…</think>` inside `content`. Their think prose here frequently
-    // contains stray `[` (candidate id refs like `[rec_a1]`, JSON preview
-    // sketches, priority tags), which fatally derails the greedy
-    // `/\[[\s\S]*\]/` array-match below by anchoring it inside the think
-    // section. So we peel `<think>` blocks BEFORE the array-match fires.
-    //
-    // Same safeguards as l1-extractor:
-    //   • non-greedy `*?` + explicit `</think>` requirement — truncated
-    //     think tags (max_tokens cap) fall through as-is instead of eating
-    //     the rest of the response, and the fallbackStoreAll safety net in
-    //     the caller then quietly stores everything (dedup no-op).
-    //   • `g` flag — multi-segment thinking is fully stripped.
-    //   • Preserve untouched `raw` for the [l1-dedup-debug] log path so
-    //     ops can still see original wire content when they need to debug
-    //     a novel A₂ variant.
-    //
-    // A₁ models (minimax-m2.7 / deepseek-v4-pro / o1 / o3 / Claude thinking
-    // API) put reasoning in a separate reasoning_content field, so `content`
-    // never has <think> here — the replace is a no-op (backward-compatible,
-    // per [[default-no-config-backward-compat]]).
     const stripped = raw.replace(/<think>[\s\S]*?<\/think>\s*/g, "");
 
     // Strip markdown code block wrappers
@@ -348,6 +339,7 @@ function parseBatchResult(
     const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
     if (!arrayMatch) {
       logger?.warn?.(`${TAG} No JSON array found in conflict detection response`);
+      if (failOnError) throw new Error("Invalid conflict decision JSON");
       return fallbackStoreAll(memories);
     }
 
@@ -357,17 +349,22 @@ function parseBatchResult(
 
     if (!Array.isArray(parsed)) {
       logger?.warn?.(`${TAG} Conflict detection response is not an array`);
+      if (failOnError) throw new Error("Invalid conflict decision JSON");
       return fallbackStoreAll(memories);
     }
 
     // Build decisions from LLM output
     const decisions: DedupDecision[] = [];
-    const validActions = ["store", "update", "merge", "skip"];
+    const validActions = ["store", "skip"];
 
     for (const item of parsed) {
-      if (!item || typeof item !== "object") continue;
+      if (!item || typeof item !== "object") {
+        if (failOnError) throw new Error("Invalid decision object");
+        continue;
+      }
       const d = item as Record<string, unknown>;
 
+      if (failOnError && typeof d.record_id !== "string") throw new Error("Invalid decision fields");
       const recordId = String(d.record_id ?? "");
       // Skip entries with empty/missing record_id — they are LLM hallucinations
       if (!recordId) {
@@ -376,6 +373,7 @@ function parseBatchResult(
       }
       const action = String(d.action ?? "store");
 
+      if (failOnError && !validActions.includes(action)) throw new Error("Invalid decision action");
       if (!validActions.includes(action)) {
         logger?.warn?.(`${TAG} Invalid action "${action}" for record ${recordId}, defaulting to store`);
       }
@@ -383,11 +381,6 @@ function parseBatchResult(
       decisions.push({
         record_id: recordId,
         action: validActions.includes(action) ? (action as DedupDecision["action"]) : "store",
-        target_ids: Array.isArray(d.target_ids) ? d.target_ids.map(String) : [],
-        merged_content: typeof d.merged_content === "string" ? d.merged_content : undefined,
-        merged_type: VALID_TYPES.includes(d.merged_type as MemoryType) ? (d.merged_type as MemoryType) : undefined,
-        merged_priority: typeof d.merged_priority === "number" ? d.merged_priority : undefined,
-        merged_timestamps: Array.isArray(d.merged_timestamps) ? d.merged_timestamps.map(String) : undefined,
       });
     }
 
@@ -395,17 +388,18 @@ function parseBatchResult(
     const decidedIds = new Set(decisions.map((d) => d.record_id));
     for (const mem of memories) {
       if (!decidedIds.has(mem.record_id)) {
+        if (failOnError) throw new Error("Missing decision");
         logger?.debug?.(`${TAG} No decision for record ${mem.record_id}, defaulting to store`);
         decisions.push({
           record_id: mem.record_id,
           action: "store",
-          target_ids: [],
         });
       }
     }
 
     return decisions;
   } catch (err) {
+    if (failOnError) throw err;
     logger?.warn?.(`${TAG} Failed to parse conflict detection result: ${err instanceof Error ? err.message : String(err)}`);
     return fallbackStoreAll(memories);
   }
@@ -418,6 +412,5 @@ function fallbackStoreAll(memories: Array<ExtractedMemory & { record_id: string 
   return memories.map((m) => ({
     record_id: m.record_id,
     action: "store" as const,
-    target_ids: [],
   }));
 }

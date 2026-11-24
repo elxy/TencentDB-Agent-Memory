@@ -15,6 +15,7 @@
 import type { ConversationMessage } from "../conversation/l0-recorder.js";
 import { formatExtractionPrompt, getExtractMemoriesSystemPrompt, type MemoryPromptMode } from "../prompts/l1-extraction.js";
 import { batchDedup } from "./l1-dedup.js";
+import { buildDedupIsolationFilter } from "./dedup-isolation.js";
 import { writeMemory, generateMemoryId } from "./l1-writer.js";
 import type { ExtractedMemory, MemoryRecord, MemoryType, DedupDecision } from "./l1-writer.js";
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
@@ -28,6 +29,10 @@ import type { LLMRunner, Logger, TraceContext } from "../types.js";
 import { buildTraceParams } from "../types.js";
 import { StorageAdapter } from "../storage/adapter.js";
 import type { ResolvedMemoryPrompt } from "../memory-prompt/types.js";
+import {
+  deterministicL1Locator,
+  type L1HistoryRun,
+} from "../content/generation-history.js";
 import { composeMemorySystemPrompt } from "../memory-prompt/composer.js";
 import { LocalStorageBackend } from "../storage/local-backend.js";
 import {
@@ -107,6 +112,14 @@ export async function extractL1Memories(params: {
     maxBackgroundMessages?: number;
     /** Enable conflict detection */
     enableDedup?: boolean;
+    /**
+     * Opt-in cross-session dedup candidate isolation. Default false keeps the
+     * existing session-scoped filter. When true only sessionId is dropped from
+     * the dedup filter (teamId/userId/agentId/taskId retained exactly), which
+     * requires at least one tenant identity; batch-dedup failures then surface
+     * instead of silently falling back to "store all".
+     */
+    dedupAcrossSessions?: boolean;
     /** Max memories extracted per call */
     maxMemoriesPerSession?: number;
     /** LLM model override */
@@ -130,6 +143,13 @@ export async function extractL1Memories(params: {
      * a CleanContextRunner (decouples from OpenClaw runtime).
      */
     llmRunner?: LLMRunner;
+    /**
+     * History-mode run. When present, the exact L0 input versions are registered
+     * before the extraction prompt, dedup candidates are bound to exact versions,
+     * official writes go through the store's formal commit entry, and a write
+     * failure is fatal (never caught into "store as new").
+     */
+    history?: L1HistoryRun;
   };
   logger?: Logger;
   /** Plugin instance ID for metric reporting (optional — metrics skipped if absent) */
@@ -149,7 +169,9 @@ export async function extractL1Memories(params: {
   const maxNewMessages = options.maxMessagesPerExtraction ?? 10;
   const maxBgMessages = options.maxBackgroundMessages ?? 5;
   const enableDedup = options.enableDedup ?? true;
+  const dedupAcrossSessions = options.dedupAcrossSessions ?? false;
   const maxMemoriesPerSession = options.maxMemoriesPerSession ?? 10;
+  const history = options.history;
 
   if (messages.length === 0) {
     logger?.debug?.(`${TAG} No messages to extract from`);
@@ -175,13 +197,29 @@ export async function extractL1Memories(params: {
   }
 
   // Split messages into background (older) + new (recent)
-  const newMessages = qualifiedMessages.slice(-maxNewMessages);
+  let newMessages = qualifiedMessages.slice(-maxNewMessages);
   const bgEndIdx = qualifiedMessages.length - newMessages.length;
-  const backgroundMessages = bgEndIdx > 0
+  let backgroundMessages = bgEndIdx > 0
     ? qualifiedMessages.slice(Math.max(0, bgEndIdx - maxBgMessages), bgEndIdx)
     : [];
 
   logger?.debug?.(`${TAG} Extracting from ${newMessages.length} new messages (+ ${backgroundMessages.length} background) [${qualifiedMessages.length} qualified from ${messages.length} input]`);
+
+  // History mode: register the EXACT version of every message we are about to
+  // supply to the model — before the model runs. Then replace the message
+  // bodies with the EXACT stored versions so the prompt and the registered
+  // version are the SAME read: a caller's cached/stale copy keyed by the same
+  // id is never fed to the model. The caller's objects are not mutated.
+  if (history) {
+    await history.registerL0Inputs([...backgroundMessages, ...newMessages].map((message) => ({ id: message.id })));
+    const withExactBody = (list: ConversationMessage[]): ConversationMessage[] =>
+      list.map((message) => {
+        const exact = history.bodyForMessage(message.id);
+        return exact !== undefined && exact !== message.content ? { ...message, content: exact } : message;
+      });
+    newMessages = withExactBody(newMessages);
+    backgroundMessages = withExactBody(backgroundMessages);
+  }
 
   // Step 1: LLM extraction (scene segmentation + memory extraction)
   //
@@ -241,6 +279,30 @@ export async function extractL1Memories(params: {
 
   logger?.debug?.(`${TAG} Total extracted memories: ${allExtracted.length} across ${scenes.length} scene(s)`);
 
+  // Validate model-declared sources against the messages actually sent this
+  // round. The model may hallucinate ids or recycle one from earlier context;
+  // only ids in this extraction's addressable input set are retained. Dropping
+  // an id is NOT "evidence verification passed": the API only exposes the
+  // addressable input set. Empty after filtering means "unknown", never
+  // "there was no evidence".
+  //
+  // The warning is intentionally count-only — never echo the memory body into
+  // logs (memory content may be sensitive).
+  const allowedSourceIds = new Set<string>([
+    ...newMessages.map((m) => m.id),
+    ...backgroundMessages.map((m) => m.id),
+  ]);
+  for (const mem of allExtracted) {
+    const declared = mem.source_message_ids;
+    const kept = declared.filter((id) => allowedSourceIds.has(id));
+    if (kept.length !== declared.length) {
+      logger?.warn?.(
+        `${TAG} Dropped ${declared.length - kept.length} model-declared source_message_id(s) outside this round's addressable input set`,
+      );
+    }
+    mem.source_message_ids = kept;
+  }
+
   if (allExtracted.length === 0) {
     // ── Diagnostic warn line: one greppable reason so ops can see WHY ──
     // Emitted only on the 0-count path (never on success), so log volume stays
@@ -287,11 +349,24 @@ export async function extractL1Memories(params: {
     extracted = extracted.slice(0, maxMemoriesPerSession);
   }
 
-  // Assign temporary IDs to extracted memories (needed for batch dedup)
-  const memoriesWithIds = extracted.map((m) => ({
+  // Assign temporary IDs to extracted memories (needed for batch dedup).
+  // History mode assigns a DETERMINISTIC program id so a repeat of the same
+  // authorized input produces the same locator and the same operation id
+  // (idempotent replay, no fabricated evidence).
+  const memoriesWithIds = extracted.map((m, index) => ({
     ...m,
-    record_id: generateMemoryId(),
+    record_id: history
+      ? deterministicL1Locator({
+          scopeKey: history.l1ScopeKey,
+          index,
+          type: m.type,
+          sceneName: m.scene_name,
+          content: m.content,
+          sourceMessageIds: m.source_message_ids,
+        })
+      : generateMemoryId(),
   }));
+  const historyRecordedAt = history ? history.recordedAtForCommit() : undefined;
 
   // Step 2: Batch Conflict Detection + Write
   let storedRecords: MemoryRecord[];
@@ -308,6 +383,13 @@ export async function extractL1Memories(params: {
   if (enableDedup) {
     try {
       const dedupStartMs = Date.now();
+      // Cross-session dedup is explicit opt-in. Off → the helper reproduces the
+      // historical session-scoped filter (sessionId retained). On → it drops
+      // only sessionId and refuses to widen without a tenant identity.
+      const dedupFilter = buildDedupIsolationFilter(
+        { teamId, userId, agentId, sessionId, taskId },
+        dedupAcrossSessions,
+      );
       const decisions = await batchDedup({
         memories: memoriesWithIds,
         config,
@@ -320,22 +402,21 @@ export async function extractL1Memories(params: {
         embeddingTimeoutMs: options.embeddingTimeoutMs,
         llmRunner: options.llmRunner,
         traceContext: { teamId, userId, agentId, sessionId },
-        ...(teamId || userId || agentId || sessionId || taskId ? { filter: { teamId, userId, agentId, sessionId, taskId } } : {}),
+        failOnError: dedupAcrossSessions,
+        ...(dedupFilter ? { filter: dedupFilter } : {}),
       });
       dedupLatencyMs = Date.now() - dedupStartMs;
 
       // ── 评测指标：去重决策分布 ──
       if (metricInstanceId) {
         try {
-          const dedupCounts = { store: 0, update: 0, merge: 0, skip: 0 };
+          const dedupCounts = { store: 0, skip: 0 };
           for (const d of decisions) {
             if (d.action in dedupCounts) {
               dedupCounts[d.action as keyof typeof dedupCounts]++;
             }
           }
           metricProducer.send({ metric: "l1_dedup_store_count", instanceId: metricInstanceId, value: dedupCounts.store, source: "core" });
-          metricProducer.send({ metric: "l1_dedup_update_count", instanceId: metricInstanceId, value: dedupCounts.update, source: "core" });
-          metricProducer.send({ metric: "l1_dedup_merge_count", instanceId: metricInstanceId, value: dedupCounts.merge, source: "core" });
           metricProducer.send({ metric: "l1_dedup_skip_count", instanceId: metricInstanceId, value: dedupCounts.skip, source: "core" });
         } catch {
           // 静默忽略，不影响业务逻辑
@@ -345,6 +426,7 @@ export async function extractL1Memories(params: {
       storedRecords = await applyDecisions({
         memoriesWithIds,
         decisions,
+        dedupAcrossSessions,
         baseDir,
         sessionKey,
         sessionId,
@@ -356,14 +438,26 @@ export async function extractL1Memories(params: {
         vectorStore: options.vectorStore,
         embeddingService: options.embeddingService,
         storage,
+        history,
+        historyRecordedAt,
       });
 
     } catch (err) {
+      // Default (session-scoped) dedup keeps the best-effort "store all"
+      // fallback. Cross-session dedup is an explicit opt-in experiment, so a
+      // conflict-detection failure must surface to the operator instead of
+      // silently degrading to "store all" and hiding the widened-scope failure.
+      if (dedupAcrossSessions || history) {
+        logger?.error?.(
+          `${TAG} Cross-session/history dedup failed (fail-fast, not storing all): ${err instanceof Error ? err.message : String(err)}`,
+        );
+        throw err;
+      }
       logger?.warn?.(`${TAG} Batch dedup failed, storing all as new: ${err instanceof Error ? err.message : String(err)}`);
-      storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, options.vectorStore, options.embeddingService, storage);
+      storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, options.vectorStore, options.embeddingService, storage, history, historyRecordedAt);
     }
   } else {
-    storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, options.vectorStore, options.embeddingService, storage);
+    storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, options.vectorStore, options.embeddingService, storage, history, historyRecordedAt);
   }
 
   const logStorage = storage ?? new StorageAdapter(new LocalStorageBackend(baseDir));
@@ -690,6 +784,7 @@ function repairExtractionJson(json: string): string {
 async function applyDecisions(params: {
   memoriesWithIds: Array<ExtractedMemory & { record_id: string }>;
   decisions: DedupDecision[];
+  dedupAcrossSessions?: boolean;
   baseDir: string;
   sessionKey: string;
   sessionId?: string;
@@ -701,8 +796,13 @@ async function applyDecisions(params: {
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
   storage?: StorageAdapter;
+  history?: L1HistoryRun;
+  historyRecordedAt?: string;
 }): Promise<MemoryRecord[]> {
   const { memoriesWithIds, decisions, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, vectorStore, embeddingService, storage } = params;
+  const historyWrite = params.history && params.historyRecordedAt !== undefined
+    ? { run: params.history, recordedAt: params.historyRecordedAt }
+    : undefined;
   const storedRecords: MemoryRecord[] = [];
 
   // Build a map from record_id → decision
@@ -715,13 +815,13 @@ async function applyDecisions(params: {
     const decision = decisionMap.get(memoryWithId.record_id) ?? {
       record_id: memoryWithId.record_id,
       action: "store" as const,
-      target_ids: [],
     };
 
     try {
       const record = await writeMemory({
         memory: memoryWithId,
         decision,
+        dedupAcrossSessions: params.dedupAcrossSessions,
         baseDir,
         sessionKey,
         sessionId,
@@ -733,12 +833,16 @@ async function applyDecisions(params: {
         vectorStore,
         embeddingService,
         storage,
+        ...(historyWrite
+          ? { history: { run: historyWrite.run, recordedAt: historyWrite.recordedAt } }
+          : {}),
       });
 
       if (record) {
         storedRecords.push(record);
       }
     } catch (err) {
+      if (params.dedupAcrossSessions || params.history) throw err;
       logger?.warn?.(
         `${TAG} Write failed for memory "${memoryWithId.content.slice(0, 50)}...": ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -764,6 +868,8 @@ async function storeAllDirectly(
   vectorStore?: IMemoryStore,
   embeddingService?: EmbeddingService,
   storage?: StorageAdapter,
+  history?: L1HistoryRun,
+  historyRecordedAt?: string,
 ): Promise<MemoryRecord[]> {
   const storedRecords: MemoryRecord[] = [];
 
@@ -774,7 +880,6 @@ async function storeAllDirectly(
         decision: {
           record_id: memoryWithId.record_id,
           action: "store",
-          target_ids: [],
         },
         baseDir,
         sessionKey,
@@ -787,11 +892,15 @@ async function storeAllDirectly(
         vectorStore,
         embeddingService,
         storage,
+        ...(history && historyRecordedAt !== undefined
+          ? { history: { run: history, recordedAt: historyRecordedAt } }
+          : {}),
       });
       if (record) {
         storedRecords.push(record);
       }
     } catch (err) {
+      if (history) throw err;
       logger?.warn?.(
         `${TAG} Write failed for memory "${memoryWithId.content.slice(0, 50)}...": ${err instanceof Error ? err.message : String(err)}`,
       );

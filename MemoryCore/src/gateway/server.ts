@@ -1994,6 +1994,7 @@ export class TdaiGateway {
     this.pipelineWorker = new PipelineWorker(this.stateBackend, executor, {
       pollIntervalMs: this.config.worker.pollMs,
       concurrency: this.config.worker.concurrency,
+      maxRetries: this.config.worker.maxRetries,
       lockTtlMs: this.config.worker.lockTtlMs,
       pendingStaleMs: this.config.worker.pendingStaleMs,
       pendingRecoveryIntervalMs: this.config.worker.pendingRecoveryIntervalMs,
